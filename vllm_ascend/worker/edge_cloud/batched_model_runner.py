@@ -539,6 +539,7 @@ class BatchedModelRunner(NPUModelRunner):
     # ------------------------------------------------------------------
     # Batched compute entry points
     # ------------------------------------------------------------------
+    @torch.inference_mode()
     def execute_model_pre(
         self,
         scheduler_output: "SchedulerOutput",
@@ -842,6 +843,7 @@ class BatchedModelRunner(NPUModelRunner):
                 deferred_state_corrections_fn),
         )
 
+    @torch.inference_mode()
     def execute_model_batched_head(
         self,
         bundles: list[_ExecuteModelBundle],
@@ -885,6 +887,7 @@ class BatchedModelRunner(NPUModelRunner):
                 bundles, batched_dp_ranks)
             head_attn_metadata: Any = ctx.merged_attn_metadata
             batch_descriptor = ctx.merged_batch_descriptor
+            cudagraph_mode = ctx.merged_cudagraph_mode
             num_tokens_padded_merged = ctx.num_tokens_padded_merged
             merged_input_ids = ctx.merged_input_ids
             merged_positions = ctx.merged_positions
@@ -892,6 +895,7 @@ class BatchedModelRunner(NPUModelRunner):
         else:
             head_attn_metadata = any_bundle.attn_metadata
             batch_descriptor = any_bundle.batch_desc
+            cudagraph_mode = any_bundle.cudagraph_mode
             num_tokens_padded_merged = sum(
                 b.num_tokens_padded for b in bundles)
             if all(b.input_ids is not None for b in bundles):
@@ -921,7 +925,7 @@ class BatchedModelRunner(NPUModelRunner):
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens_padded_merged,
                 num_tokens_across_dp=num_tokens_across_dp_merged,
-                aclgraph_runtime_mode=any_bundle.cudagraph_mode,
+                aclgraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_descriptor,
                 num_actual_tokens=num_tokens_merged,
                 model_instance=self.model,
@@ -968,6 +972,7 @@ class BatchedModelRunner(NPUModelRunner):
                 }))
         return results
 
+    @torch.inference_mode()
     def execute_model_batched_tail(
         self,
         bundles: list[_ExecuteModelBundle],
@@ -1036,10 +1041,12 @@ class BatchedModelRunner(NPUModelRunner):
                 bundles, batched_dp_ranks)
             tail_attn_metadata: Any = ctx.merged_attn_metadata
             batch_descriptor = ctx.merged_batch_descriptor
+            cudagraph_mode = ctx.merged_cudagraph_mode
             num_tokens_padded_merged = ctx.num_tokens_padded_merged
         else:
             tail_attn_metadata = any_bundle.attn_metadata
             batch_descriptor = any_bundle.batch_desc
+            cudagraph_mode = any_bundle.cudagraph_mode
             num_tokens_padded_merged = sum(
                 b.num_tokens_padded for b in bundles)
         kv_connector_output = None
@@ -1052,7 +1059,7 @@ class BatchedModelRunner(NPUModelRunner):
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens_padded_merged,
                 num_tokens_across_dp=num_tokens_across_dp_merged,
-                aclgraph_runtime_mode=any_bundle.cudagraph_mode,
+                aclgraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_descriptor,
                 num_actual_tokens=num_tokens_merged,
                 model_instance=self.model,
@@ -1092,6 +1099,7 @@ class BatchedModelRunner(NPUModelRunner):
         return (hidden_states, merged_sample_hidden_states,
                 merged_logits, kv_connector_output)
 
+    @torch.inference_mode()
     def execute_model_post_batched(
         self,
         bundle: _ExecuteModelBundle,
@@ -1256,10 +1264,13 @@ class BatchedModelRunner(NPUModelRunner):
             merged_attn_state = next(iter(unique_states))
 
         # ---- Step 2: dispatch the merged batch to get the merged
-        # padded sizes.
+        # padded sizes and the merged ``CUDAGraphMode``. The merged
+        # mode is what the batched head/tail forward should run
+        # under (NOT a single dp_rank's mode).
         any_batch_desc = bundles[0].batch_desc
         if any_batch_desc is None:
             merged_batch_descriptor = None
+            merged_cudagraph_mode = CUDAGraphMode.NONE
             merged_num_tokens_padded = merged_num_actual_tokens
             merged_num_reqs_padded = merged_num_reqs
         else:
@@ -1273,7 +1284,7 @@ class BatchedModelRunner(NPUModelRunner):
                 (b.batch_desc.num_active_loras
                  if b.batch_desc is not None else 0)
                 for b in bundles)
-            _, merged_batch_descriptor = (
+            merged_cudagraph_mode, merged_batch_descriptor = (
                 self.cudagraph_dispatcher.dispatch(
                     num_tokens=merged_num_actual_tokens,
                     has_lora=has_lora_any,
@@ -1754,6 +1765,7 @@ class BatchedModelRunner(NPUModelRunner):
         ctx = _MergedAttnContext(
             merged_attn_metadata=merged_attn_metadata,
             merged_batch_descriptor=merged_batch_descriptor,
+            merged_cudagraph_mode=merged_cudagraph_mode,
             num_tokens_padded_merged=merged_num_tokens_padded,
             merged_input_ids=merged_input_ids_ctx,
             merged_positions=merged_positions_ctx,

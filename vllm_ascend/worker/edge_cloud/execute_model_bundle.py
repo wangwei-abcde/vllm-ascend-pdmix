@@ -201,6 +201,7 @@ class _MergedAttnContext:
 
     merged_attn_metadata: Any
     merged_batch_descriptor: Any
+    merged_cudagraph_mode: "CUDAGraphMode"
     num_tokens_padded_merged: int
     merged_input_ids: torch.Tensor | None
     merged_positions: torch.Tensor | None
