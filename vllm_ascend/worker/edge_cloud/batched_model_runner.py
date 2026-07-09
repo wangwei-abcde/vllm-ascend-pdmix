@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import time
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -45,7 +45,7 @@ from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -68,28 +68,6 @@ if TYPE_CHECKING:
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
-
-
-@dataclass
-class _StubCommonAttnMetadata:
-    """Minimal stub carrying the fields the GDN sub-patchers
-    (``_patched_build_spec`` / ``_patched_build_prefill`` /
-    ``_patched_build_decode``) read off
-    ``common_attn_metadata``.
-
-    Used by ``BatchedModelRunner._merge_gdn_layer_attn`` to feed the
-    patched builders when running the batched GDN path. Only
-    ``query_start_loc`` (for ``.device``) and
-    ``query_start_loc_cpu`` (the merged full cu_seqlen) plus
-    ``num_decode_draft_tokens_cpu`` (the merged per-req spec flag)
-    are needed; the rest of
-    :class:`vllm.v1.attention.backend.CommonAttentionMetadata` is not
-    read.
-    """
-
-    query_start_loc: torch.Tensor
-    query_start_loc_cpu: torch.Tensor
-    num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
 
 class BatchedModelRunner(NPUModelRunner):
@@ -115,12 +93,16 @@ class BatchedModelRunner(NPUModelRunner):
       :meth:`execute_model_batched_head` / ``_tail`` (single-shot
       merged forward + ``compute_logits``),
       :meth:`execute_model_post_batched` (per-dp_rank state write).
-    - Adds the merged-attn helpers :meth:`_get_or_build_merged_attn_ctx`,
-      :meth:`_merge_layer_attn` (per-layer ``AscendMetadata``),
-      :meth:`_merge_gdn_layer_attn` (per-layer
-      ``GDNAttentionMetadata``) plus the per-layer routing helpers
-      :meth:`_get_bpb_for_layer` / :meth:`_is_c8_attn_layer` and the
-      global-buffer allocator :meth:`_allocate_global_kv_cache_tensors`.
+    - Adds the merged-attn helper :meth:`_get_or_build_merged_attn_ctx`
+      that builds a merged ``AscendCommonAttentionMetadata`` from
+      the per-dp_rank ``_ExecuteModelBundle``s and feeds it back
+      into each per-(kv_cache_gid, attn_gid) builder (the per-layer
+      ``AscendMetadata`` / ``GDNAttentionMetadata`` is produced by
+      the builder itself — no per-layer manual merge logic). Also
+      adds the per-layer routing helpers
+      :meth:`_get_bpb_for_layer` / :meth:`_is_c8_attn_layer` and
+      the global-buffer allocator
+      :meth:`_allocate_global_kv_cache_tensors`.
 
     The original :class:`NPUModelRunner` is unchanged. Use this class
     in place of :class:`NPUModelRunner` when constructing the shared-
@@ -551,6 +533,9 @@ class BatchedModelRunner(NPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
 
+    
+    def _should_save_for_attn_metadata(self) -> bool:
+        return True
     # ------------------------------------------------------------------
     # Batched compute entry points
     # ------------------------------------------------------------------
@@ -795,6 +780,42 @@ class BatchedModelRunner(NPUModelRunner):
                 generators=self.input_batch.sampling_metadata.generators,
             )
 
+        # Re-bundle the per-dp_rank attention state that
+        # ``_build_attention_metadata`` already saved to ``self.*``
+        # (via ``_should_save_for_attn_metadata()=True``): the
+        # ``self.cm_base`` ``AscendCommonAttentionMetadata``
+        # directly, plus a list of per-kv_cache_gid override
+        # dicts (``self.per_gid_cm[kv_cache_gid]`` — exactly what
+        # ``_save`` wrote for each gid: ``encoder_seq_lens`` /
+        # ``encoder_seq_lens_cpu`` / GDN's ``query_start_loc(_cpu)``
+        # / gid>0's ``block_table_tensor`` / ``slot_mapping``),
+        # plus the per-(kv_cache_gid, attn_gid) ``(cascade_attn_prefix_len,
+        # extra_attn_metadata_args)`` tuple saved by
+        # ``_build_attn_group_metadata``. The batched merge step
+        # re-uses these structures verbatim — it never re-extracts
+        # the raw fields.
+        # ---- guard the async GPU->CPU copy (matches
+        # ``_build_attention_metadata``) ----
+        cm_base = getattr(self, "cm_base", None)
+        if cm_base is None:
+            raise RuntimeError(
+                "BatchedModelRunner.execute_model_pre expected "
+                "self.cm_base to be saved by _build_attention_metadata "
+                "(via _should_save_for_attn_metadata=True).")
+        per_gid_cm = getattr(self, "per_gid_cm", None)
+        if per_gid_cm is None:
+            raise RuntimeError(
+                "BatchedModelRunner.execute_model_pre expected "
+                "self.per_gid_cm to be saved by _build_attention_metadata.")
+        per_gid_extra = getattr(self, "per_gid_extra", None)
+        if per_gid_extra is None:
+            raise RuntimeError(
+                "BatchedModelRunner.execute_model_pre expected "
+                "self.per_gid_extra to be saved by "
+                "_build_attn_group_metadata (via "
+                "_should_save_for_attn_metadata=True).")
+        common_attn_metadata = cm_base
+
         return _ExecuteModelBundle(
             input_ids=input_ids,
             positions=positions,
@@ -811,6 +832,10 @@ class BatchedModelRunner(NPUModelRunner):
             cudagraph_mode=cudagraph_mode,
             batch_desc=batch_desc,
             attn_metadata=attn_metadata,
+            num_reqs_actual=self.input_batch.num_reqs,
+            common_attn_metadata=common_attn_metadata,
+            per_gid_cm=per_gid_cm,
+            per_gid_extra=per_gid_extra,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=cudagraph_stats,
             deferred_state_corrections_fn=(
@@ -1147,11 +1172,11 @@ class BatchedModelRunner(NPUModelRunner):
         sub-batches in Python
         (``_forward_c8_chunked_prefill``). That split assumes a
         contiguous ``[decodes…][prefills…]`` layout, which the
-        simple ``block_tables`` / ``slot_mapping`` /
-        ``actual_seq_lengths_q`` concat in ``_merge_layer_attn`` does
-        NOT guarantee when different dp_ranks have different
-        per-dp_rank ``attn_state``. We therefore refuse C8 layers
-        in the batched path; per-dp_rank execution handles them.
+        simple block_table / slot_mapping / cu_seqlen concat in
+        ``_get_or_build_merged_attn_ctx`` does NOT guarantee when
+        different dp_ranks have different per-dp_rank
+        ``attn_state``. We therefore refuse C8 layers in the
+        batched path; per-dp_rank execution handles them.
         """
         # The edge cloud shared model never runs through a
         # C8-quantized attention layer today, so returning False is
@@ -1189,51 +1214,54 @@ class BatchedModelRunner(NPUModelRunner):
                 "called but self._per_dp_offsets is unset. Did "
                 "initialize_kv_cache run for all dp_ranks?")
 
-        def _layer_dict(b: "_ExecuteModelBundle") -> dict:
-            md = b.attn_metadata
-            return md[0] if isinstance(md, list) else md
-
-        template_layers = list(_layer_dict(bundles[0]).keys())
-        for b in bundles[1:]:
-            assert _layer_dict(b).keys() == set(template_layers), (
-                "dp_rank attn_metadata layer sets must agree across "
-                "dp_ranks for batched forward")
-
-        merged_attn_metadata: dict = {}
-        from vllm_ascend.attention.attention_v1 import AscendMetadata
-        from vllm.v1.attention.backends.gdn_attn import (
-            GDNAttentionMetadata,
+        from vllm_ascend.attention.attention_v1 import (
+            AscendAttentionState,
         )
 
-        def _merge_layer(layer_name: str):
-            md_template = _layer_dict(bundles[0])[layer_name]
-            bpb = self._get_bpb_for_layer(layer_name)
-            if isinstance(md_template, AscendMetadata):
-                return self._merge_layer_attn(
-                    layer_name, bundles, batched_dp_ranks,
-                    per_dp_offsets, bpb)
-            elif isinstance(md_template, GDNAttentionMetadata):
-                return self._merge_gdn_layer_attn(
-                    layer_name, bundles, batched_dp_ranks,
-                    per_dp_offsets, bpb)
-            else:
+        dp_size = self.parallel_config.data_parallel_size
+        bs = self.block_size
+        num_kv_cache_gids = len(self.kv_cache_config.kv_cache_groups)
+
+        # ---- Step 0: per-dp_rank unpad (slide per-req fields down
+        # to actual sizes via ``cm.unpadded``).
+        cms_unpadded: list[AscendCommonAttentionMetadata] = []
+        for b in bundles:
+            cm = b.common_attn_metadata
+            cms_unpadded.append(
+                cm.unpadded(cm.num_actual_tokens, b.num_reqs_actual))
+
+        # ---- Step 1: merged scalars + ``attn_state`` unification.
+        merged_num_actual_tokens = sum(
+            cm.num_actual_tokens for cm in cms_unpadded)
+        merged_max_query_len = max(cm.max_query_len for cm in cms_unpadded)
+        merged_max_seq_len = max(cm.max_seq_len for cm in cms_unpadded)
+        # ``merged_num_reqs`` is the sum of per-dp_rank actual
+        # request counts (NOT the cudagraph-padded total). The
+        # merged tensor is initially this size, and per-req fields
+        # are then padded out to ``merged_num_reqs_padded`` (see
+        # ``_cat_per_req_pad``).
+        merged_num_reqs = sum(b.num_reqs_actual for b in bundles)
+
+        states = [cm.attn_state for cm in cms_unpadded]
+        unique_states = set(states)
+        if len(unique_states) > 1:
+            if AscendAttentionState.SpecDecoding in unique_states:
                 raise NotImplementedError(
-                    f"Unsupported attention metadata type for "
-                    f"layer {layer_name!r}: "
-                    f"{type(md_template).__name__}; batched forward "
-                    f"currently supports AscendMetadata and "
-                    f"GDNAttentionMetadata only.")
+                    "Cannot merge SpecDecoding with other states "
+                    f"{unique_states}; SpecDecoding uses a "
+                    "separate tree path that the batched forward "
+                    "does not yet support.")
+            merged_attn_state = AscendAttentionState.ChunkedPrefill
+        else:
+            merged_attn_state = next(iter(unique_states))
 
-        for layer_name in template_layers:
-            merged_attn_metadata[layer_name] = _merge_layer(
-                layer_name)
-
-        first_merged = next(iter(merged_attn_metadata.values()))
-        num_tokens_merged = first_merged.num_actual_tokens
+        # ---- Step 2: dispatch the merged batch to get the merged
+        # padded sizes.
         any_batch_desc = bundles[0].batch_desc
         if any_batch_desc is None:
             merged_batch_descriptor = None
-            num_tokens_padded_merged = num_tokens_merged
+            merged_num_tokens_padded = merged_num_actual_tokens
+            merged_num_reqs_padded = merged_num_reqs
         else:
             has_lora_any = any(
                 b.batch_desc is not None and b.batch_desc.has_lora
@@ -1247,25 +1275,461 @@ class BatchedModelRunner(NPUModelRunner):
                 for b in bundles)
             _, merged_batch_descriptor = (
                 self.cudagraph_dispatcher.dispatch(
-                    num_tokens=num_tokens_merged,
+                    num_tokens=merged_num_actual_tokens,
                     has_lora=has_lora_any,
                     uniform_decode=uniform_decode_merged,
                     valid_modes=None,
-                    invalid_modes={CUDAGraphMode.FULL},
+                    invalid_modes=None,
                     num_active_loras=num_active_loras_merged,
                 ))
-            num_tokens_padded_merged = (
+            merged_num_reqs_padded = (
+                merged_batch_descriptor.num_reqs
+                if merged_batch_descriptor.num_reqs is not None
+                else merged_num_reqs)
+            merged_num_tokens_padded = (
                 merged_batch_descriptor.num_tokens)
 
-        def _actual_tokens(b: "_ExecuteModelBundle") -> int:
-            md = b.attn_metadata
-            if isinstance(md, list):
-                md = md[0][next(iter(md[0]))]
+        # ---- Step 3: merged cu_seqlen (``query_start_loc`` /
+        # ``query_start_loc_cpu``). Unpad → cumsum-merge → pad to
+        # ``merged_num_reqs_padded + 1`` by repeating the last
+        # value (padded rows have query length 0).
+        merged_qsl_cpu_list = [0]
+        for cm in cms_unpadded:
+            n = cm.num_reqs  # == num_reqs_actual (unpadded)
+            if n > 0:
+                local = cm.query_start_loc_cpu[1:n + 1]
+                cumulative = local + merged_qsl_cpu_list[-1]
+                merged_qsl_cpu_list.extend(cumulative.tolist())
             else:
-                md = next(iter(md.values()))
-            return md.num_actual_tokens
+                merged_qsl_cpu_list.append(merged_qsl_cpu_list[-1])
+        merged_query_start_loc_cpu = torch.tensor(
+            merged_qsl_cpu_list, dtype=torch.int32, device="cpu")
+        if (merged_query_start_loc_cpu.shape[0] - 1
+                < merged_num_reqs_padded):
+            last = merged_query_start_loc_cpu[-1].item()
+            pad = torch.full(
+                (merged_num_reqs_padded + 1
+                 - merged_query_start_loc_cpu.shape[0],),
+                last, dtype=torch.int32, device="cpu")
+            merged_query_start_loc_cpu = torch.cat(
+                [merged_query_start_loc_cpu, pad])
+        elif (merged_query_start_loc_cpu.shape[0] - 1
+              > merged_num_reqs_padded):
+            merged_query_start_loc_cpu = merged_query_start_loc_cpu[
+                :merged_num_reqs_padded + 1]
+        merged_query_start_loc = merged_query_start_loc_cpu.to(
+            self.device)
 
-        n_actuals = [_actual_tokens(b) for b in bundles]
+        # ---- Step 4: merged per-req fields via unpad-cat-pad.
+        def _cat_per_req_pad(get_field, pad_value, dtype,
+                             device) -> torch.Tensor | None:
+            parts = [get_field(cm) for cm in cms_unpadded]
+            parts = [p for p in parts if p is not None]
+            if not parts:
+                return None
+            merged = torch.cat(parts, dim=0)
+            if merged.shape[0] < merged_num_reqs_padded:
+                pad_shape = list(merged.shape)
+                pad_shape[0] = (
+                    merged_num_reqs_padded - merged.shape[0])
+                pad = torch.full(
+                    pad_shape, pad_value, dtype=dtype, device=device)
+                merged = torch.cat([merged, pad], dim=0)
+            elif merged.shape[0] > merged_num_reqs_padded:
+                merged = merged[:merged_num_reqs_padded]
+            return merged
+
+        any_cm = cms_unpadded[0] if cms_unpadded else bundles[
+            0].common_attn_metadata
+        merged_seq_lens = _cat_per_req_pad(
+            lambda cm: cm.seq_lens, 0, any_cm.seq_lens.dtype,
+            self.device)
+        merged_seq_lens_cpu = _cat_per_req_pad(
+            lambda cm: cm.seq_lens_cpu, 0,
+            any_cm.seq_lens_cpu.dtype
+            if any_cm.seq_lens_cpu is not None else torch.int32,
+            "cpu") if any(cm.seq_lens_cpu is not None
+                          for cm in cms_unpadded) else None
+        merged_seq_lens_cpu_upper = _cat_per_req_pad(
+            lambda cm: cm.seq_lens_cpu_upper_bound, 0,
+            any_cm.seq_lens_cpu_upper_bound.dtype
+            if any_cm.seq_lens_cpu_upper_bound is not None
+            else torch.int32,
+            "cpu") if any(cm.seq_lens_cpu_upper_bound is not None
+                          for cm in cms_unpadded) else None
+        merged__seq_lens_cpu = _cat_per_req_pad(
+            lambda cm: cm._seq_lens_cpu, 0,
+            any_cm._seq_lens_cpu.dtype
+            if any_cm._seq_lens_cpu is not None else torch.int32,
+            "cpu") if any(cm._seq_lens_cpu is not None
+                          for cm in cms_unpadded) else None
+        merged_num_computed_tokens_cpu = _cat_per_req_pad(
+            lambda cm: cm.num_computed_tokens_cpu, 0,
+            any_cm.num_computed_tokens_cpu.dtype
+            if any_cm.num_computed_tokens_cpu is not None
+            else torch.int32,
+            "cpu") if any(cm.num_computed_tokens_cpu is not None
+                          for cm in cms_unpadded) else None
+        # ``is_prefilling``: pad value is False (matches
+        # ``_build_attention_metadata`` line 4378).
+        merged_is_prefilling = _cat_per_req_pad(
+            lambda cm: cm.is_prefilling, False,
+            torch.bool, self.device)
+        if merged_is_prefilling is not None:
+            merged_is_prefilling[merged_num_reqs:] = False
+
+        # ``positions`` / ``positions_cpu`` (DSA): ``unpadded``
+        # keeps them full-length; slice to
+        # ``[:num_actual_tokens]`` and cat.
+        if all(cm.positions is not None for cm in cms_unpadded):
+            merged_positions = torch.cat(
+                [cm.positions[:cm.num_actual_tokens]
+                 for cm in cms_unpadded],
+                dim=-1)
+            if merged_positions.shape[-1] < merged_num_tokens_padded:
+                pad_shape = list(merged_positions.shape)
+                pad_shape[-1] = (
+                    merged_num_tokens_padded
+                    - merged_positions.shape[-1])
+                pad = torch.zeros(
+                    pad_shape, dtype=merged_positions.dtype,
+                    device=merged_positions.device)
+                merged_positions = torch.cat(
+                    [merged_positions, pad], dim=-1)
+            elif (merged_positions.shape[-1]
+                  > merged_num_tokens_padded):
+                merged_positions = merged_positions[
+                    ..., :merged_num_tokens_padded]
+        else:
+            merged_positions = None
+        if all(cm.positions_cpu is not None for cm in cms_unpadded):
+            merged_positions_cpu = torch.cat(
+                [cm.positions_cpu[:cm.num_actual_tokens]
+                 for cm in cms_unpadded],
+                dim=-1)
+            if (merged_positions_cpu.shape[-1]
+                    < merged_num_tokens_padded):
+                pad_shape = list(merged_positions_cpu.shape)
+                pad_shape[-1] = (
+                    merged_num_tokens_padded
+                    - merged_positions_cpu.shape[-1])
+                pad = torch.zeros(
+                    pad_shape,
+                    dtype=merged_positions_cpu.dtype,
+                    device=merged_positions_cpu.device)
+                merged_positions_cpu = torch.cat(
+                    [merged_positions_cpu, pad], dim=-1)
+            elif (merged_positions_cpu.shape[-1]
+                  > merged_num_tokens_padded):
+                merged_positions_cpu = merged_positions_cpu[
+                    ..., :merged_num_tokens_padded]
+        else:
+            merged_positions_cpu = None
+
+        # ``actual_seq_lengths_q``: per-token list of query lengths
+        # (``1`` for decode, ``num_prompt_tokens`` for prefill).
+        # ``unpadded`` slices it to ``[:num_actual_tokens]``; we
+        # concat across dp_ranks and pad with 0 to
+        # ``merged_num_tokens_padded`` (padded tokens have no
+        # associated query length).
+        if all(cm.actual_seq_lengths_q is not None
+               and len(cm.actual_seq_lengths_q) > 0
+               for cm in cms_unpadded):
+            merged_actual_seq_lengths_q = []
+            for cm in cms_unpadded:
+                merged_actual_seq_lengths_q.extend(
+                    cm.actual_seq_lengths_q[:cm.num_actual_tokens])
+            while (len(merged_actual_seq_lengths_q)
+                   < merged_num_tokens_padded):
+                merged_actual_seq_lengths_q.append(0)
+            merged_actual_seq_lengths_q = (
+                merged_actual_seq_lengths_q[:merged_num_tokens_padded])
+        else:
+            merged_actual_seq_lengths_q = None
+
+        # ---- Step 5: per-(kv_cache_gid, attn_gid) build.
+        merged_attn_metadata: dict = {}
+        from vllm_ascend.patch.worker.patch_gdn_attn import (
+            GDNAttentionMetadataBuilder,
+        )
+        for kv_cache_gid in range(num_kv_cache_gids):
+            for attn_gid in range(
+                    len(self.attn_groups[kv_cache_gid])):
+                attn_group = self.attn_groups[kv_cache_gid][attn_gid]
+                builder = attn_group.get_metadata_builder(0)
+                bpb = self._get_bpb_for_layer(
+                    attn_group.layer_names[0])
+
+                # Per-gid block_table_tensor. gid=0 is on
+                # ``cm_base.block_table_tensor`` (kept full-length
+                # by ``unpadded``); gid>0 lives on
+                # ``b.per_gid_cm[kv_cache_gid]["block_table_tensor"]``
+                # (saved by ``_save('block_table_tensor')`` in
+                # ``_build_attention_metadata`` only for
+                # ``kv_cache_gid > 0``). Unpad to actual
+                # num_reqs_actual, remap+cat, pad to
+                # ``merged_num_reqs_padded``.
+                parts_bt = []
+                for cm_unpadded, b, k in zip(
+                        cms_unpadded, bundles, batched_dp_ranks):
+                    if kv_cache_gid == 0:
+                        gid_bt = cm_unpadded.block_table_tensor
+                    else:
+                        gid_bt = b.per_gid_cm[kv_cache_gid][
+                            "block_table_tensor"]
+                    local = gid_bt[:b.num_reqs_actual]
+                    remapped = torch.where(
+                        local == 0, local,
+                        ((local // bpb) * dp_size
+                         + per_dp_offsets[k]) * bpb
+                        + (local % bpb))
+                    parts_bt.append(remapped)
+                merged_block_tables = torch.cat(parts_bt, dim=0)
+                if (merged_block_tables.shape[0]
+                        < merged_num_reqs_padded):
+                    pad_shape = list(merged_block_tables.shape)
+                    pad_shape[0] = (
+                        merged_num_reqs_padded
+                        - merged_block_tables.shape[0])
+                    pad = torch.zeros(
+                        pad_shape,
+                        dtype=merged_block_tables.dtype,
+                        device=merged_block_tables.device)
+                    merged_block_tables = torch.cat(
+                        [merged_block_tables, pad], dim=0)
+                elif (merged_block_tables.shape[0]
+                      > merged_num_reqs_padded):
+                    merged_block_tables = merged_block_tables[
+                        :merged_num_reqs_padded]
+
+                # Per-gid slot_mapping.
+                parts_sm = []
+                for cm_unpadded, b, k in zip(
+                        cms_unpadded, bundles, batched_dp_ranks):
+                    if kv_cache_gid == 0:
+                        gid_sm = cm_unpadded.slot_mapping
+                    else:
+                        gid_sm = b.per_gid_cm[kv_cache_gid][
+                            "slot_mapping"]
+                    n = b.common_attn_metadata.num_actual_tokens
+                    local = gid_sm[:n]
+                    remapped = torch.where(
+                        local == PAD_SLOT_ID, local,
+                        ((local // bs) * dp_size
+                         + per_dp_offsets[k]) * bs
+                        + (local % bs))
+                    parts_sm.append(remapped)
+                merged_slot_mapping = torch.cat(parts_sm, dim=0)
+                if (merged_slot_mapping.shape[0]
+                        < merged_num_tokens_padded):
+                    pad = torch.full(
+                        (merged_num_tokens_padded
+                         - merged_slot_mapping.shape[0],),
+                        PAD_SLOT_ID,
+                        dtype=merged_slot_mapping.dtype,
+                        device=merged_slot_mapping.device)
+                    merged_slot_mapping = torch.cat(
+                        [merged_slot_mapping, pad], dim=0)
+                elif (merged_slot_mapping.shape[0]
+                      > merged_num_tokens_padded):
+                    merged_slot_mapping = merged_slot_mapping[
+                        :merged_num_tokens_padded]
+
+                # Per-gid encoder_seq_lens / encoder_seq_lens_cpu.
+                def _cat_per_gid_per_req(field_name, pad_value):
+                    tensors = []
+                    for b in bundles:
+                        t = b.per_gid_cm[kv_cache_gid].get(field_name)
+                        if t is not None:
+                            tensors.append((b, t))
+                    if not tensors:
+                        return None
+                    merged = torch.cat(
+                        [t[:b.num_reqs_actual] for b, t in tensors],
+                        dim=0)
+                    if merged.shape[0] < merged_num_reqs_padded:
+                        pad_shape = list(merged.shape)
+                        pad_shape[0] = (
+                            merged_num_reqs_padded - merged.shape[0])
+                        pad = torch.full(
+                            pad_shape, pad_value,
+                            dtype=merged.dtype,
+                            device=merged.device)
+                        merged = torch.cat([merged, pad], dim=0)
+                    elif merged.shape[0] > merged_num_reqs_padded:
+                        merged = merged[:merged_num_reqs_padded]
+                    return merged
+
+                merged_encoder_seq_lens = _cat_per_gid_per_req(
+                    "encoder_seq_lens", 0)
+                merged_encoder_seq_lens_cpu = _cat_per_gid_per_req(
+                    "encoder_seq_lens_cpu", 0)
+
+                # GDN per-gid override of ``query_start_loc`` /
+                # ``query_start_loc_cpu``. Each dp_rank's
+                # ``gdn_query_start_loc`` is the unpadded version of
+                # its cm_base ``query_start_loc`` (set by
+                # ``_build_attention_metadata`` line 4538-4539 when
+                # the builder is ``GDNAttentionMetadataBuilder``).
+                # Unpad → cumsum-merge → pad to
+                # ``merged_num_reqs_padded + 1`` (repeating the
+                # last value; padded rows have query length 0).
+                # ``GDNAttentionMetadataBuilder`` was imported at the
+                # top of the per-(k, a) loop (line 1432).
+                gdn_merged_qsl_cpu = None
+                gdn_merged_qsl = None
+                if isinstance(builder, GDNAttentionMetadataBuilder):
+                    gdn_merged_qsl_cpu_list = [0]
+                    for b in bundles:
+                        gdn_qsl_cpu = b.per_gid_cm[kv_cache_gid].get(
+                            "query_start_loc_cpu")
+                        if gdn_qsl_cpu is None:
+                            # No GDN override for this gid /
+                            # dp_rank — fall back to the
+                            # non-GDN merged value.
+                            gdn_merged_qsl_cpu = (
+                                merged_query_start_loc_cpu)
+                            gdn_merged_qsl = merged_query_start_loc
+                            break
+                        n = b.num_reqs_actual
+                        if n > 0:
+                            local = gdn_qsl_cpu[1:n + 1]
+                            cumulative = local + (
+                                gdn_merged_qsl_cpu_list[-1])
+                            gdn_merged_qsl_cpu_list.extend(
+                                cumulative.tolist())
+                        else:
+                            gdn_merged_qsl_cpu_list.append(
+                                gdn_merged_qsl_cpu_list[-1])
+                    if gdn_merged_qsl_cpu is None:
+                        gdn_merged_qsl_cpu_t = torch.tensor(
+                            gdn_merged_qsl_cpu_list,
+                            dtype=torch.int32, device="cpu")
+                        if (gdn_merged_qsl_cpu_t.shape[0] - 1
+                                < merged_num_reqs_padded):
+                            last = gdn_merged_qsl_cpu_t[-1].item()
+                            pad = torch.full(
+                                (merged_num_reqs_padded + 1
+                                 - gdn_merged_qsl_cpu_t.shape[0],),
+                                last, dtype=torch.int32,
+                                device="cpu")
+                            gdn_merged_qsl_cpu_t = torch.cat(
+                                [gdn_merged_qsl_cpu_t, pad])
+                        elif (gdn_merged_qsl_cpu_t.shape[0] - 1
+                              > merged_num_reqs_padded):
+                            gdn_merged_qsl_cpu_t = (
+                                gdn_merged_qsl_cpu_t[
+                                    :merged_num_reqs_padded + 1])
+                        gdn_merged_qsl_cpu = gdn_merged_qsl_cpu_t
+                        gdn_merged_qsl = (
+                            gdn_merged_qsl_cpu_t.to(self.device))
+
+                # Assemble the per-gid merged cm.
+                cm_merged = AscendCommonAttentionMetadata(
+                    query_start_loc=(
+                        gdn_merged_qsl
+                        if gdn_merged_qsl is not None
+                        else merged_query_start_loc),
+                    query_start_loc_cpu=(
+                        gdn_merged_qsl_cpu
+                        if gdn_merged_qsl_cpu is not None
+                        else merged_query_start_loc_cpu),
+                    seq_lens=merged_seq_lens,
+                    seq_lens_cpu=merged_seq_lens_cpu,
+                    num_reqs=merged_num_reqs_padded,
+                    num_actual_tokens=merged_num_actual_tokens,
+                    max_query_len=merged_max_query_len,
+                    max_seq_len=merged_max_seq_len,
+                    block_table_tensor=merged_block_tables,
+                    slot_mapping=merged_slot_mapping,
+                    encoder_seq_lens=merged_encoder_seq_lens,
+                    encoder_seq_lens_cpu=merged_encoder_seq_lens_cpu,
+                    causal=any_cm.causal,
+                    is_prefilling=merged_is_prefilling,
+                    num_input_tokens=merged_num_tokens_padded,
+                    actual_seq_lengths_q=merged_actual_seq_lengths_q,
+                    positions=merged_positions,
+                    positions_cpu=merged_positions_cpu,
+                    attn_state=merged_attn_state,
+                    num_computed_tokens_cpu=(
+                        merged_num_computed_tokens_cpu),
+                    decode_token_per_req=any_cm.decode_token_per_req,
+                    seq_lens_cpu_upper_bound=(
+                        merged_seq_lens_cpu_upper),
+                    _seq_lens_cpu=merged__seq_lens_cpu,
+                )
+
+                # Per-(kv_cache_gid, attn_gid) extras. Read from
+                # ``bundle.per_gid_extra[(k, a)]`` (the
+                # ``(cascade_attn_prefix_len,
+                # extra_attn_metadata_args)`` tuple saved by
+                # ``_build_attn_group_metadata``).
+                merged_cascade_attn_prefix_len = 0
+                merged_extra_args: dict[str, Any] = {}
+                for b in bundles:
+                    cascade_attn_prefix_len, extra_args = (
+                        b.per_gid_extra[(kv_cache_gid, attn_gid)])
+                    merged_cascade_attn_prefix_len += (
+                        cascade_attn_prefix_len)
+                    for k_key, v in extra_args.items():
+                        if k_key in ("num_accepted_tokens",
+                                     "num_decode_draft_tokens_cpu"):
+                            tensors = [
+                                b2.per_gid_extra[
+                                    (kv_cache_gid, attn_gid)][1].get(
+                                        k_key)
+                                for b2 in bundles
+                                if b2.per_gid_extra[(
+                                    kv_cache_gid, attn_gid)][1].get(
+                                        k_key) is not None]
+                            t_cat = torch.cat(
+                                [t[:b2.num_reqs_actual]
+                                 for t, b2 in zip(tensors, bundles)],
+                                dim=0)
+                            if (t_cat.shape[0]
+                                    < merged_num_reqs_padded):
+                                pad = torch.zeros(
+                                    merged_num_reqs_padded
+                                    - t_cat.shape[0],
+                                    dtype=t_cat.dtype,
+                                    device=t_cat.device)
+                                t_cat = torch.cat([t_cat, pad])
+                            elif t_cat.shape[0] > merged_num_reqs_padded:
+                                t_cat = t_cat[:merged_num_reqs_padded]
+                            merged_extra_args[k_key] = t_cat
+                        elif k_key == "num_reqs_actual":
+                            # DSA scalar: sum across dp_ranks.
+                            merged_extra_args[k_key] = (
+                                merged_extra_args.get(k_key, 0) + v)
+                        elif k_key in ("compress_ratio", "block_size"):
+                            # DSA scalar: take-first (uniform).
+                            merged_extra_args.setdefault(k_key, v)
+                        elif k_key.endswith("_ratio_to_sas_metadata"):
+                            # DSA per-builder state: not supported
+                            # in the batched path.
+                            raise NotImplementedError(
+                                f"Layer {attn_group.layer_names[0]}: "
+                                f"DSA {k_key!r} is set on dp_rank "
+                                f"bundle; the batched forward "
+                                f"does not yet support merging "
+                                f"per-builder ratio metadata.")
+                        else:
+                            # Unknown extra arg — pass through the
+                            # first non-None value (defensive).
+                            merged_extra_args.setdefault(k_key, v)
+
+                attn_metadata_i = builder.build(
+                    common_prefix_len=merged_cascade_attn_prefix_len,
+                    common_attn_metadata=cm_merged,
+                    **merged_extra_args)
+                for ln in attn_group.layer_names:
+                    merged_attn_metadata[ln] = attn_metadata_i
+
+        # ---- Step 6: ``merged_input_ids`` /
+        # ``merged_positions`` / ``merged_inputs_embeds`` for
+        # downstream ``_model_forward`` consumption.
+        n_actuals = [
+            b.common_attn_metadata.num_actual_tokens for b in bundles]
         if all(b.input_ids is not None for b in bundles):
             merged_input_ids_ctx = torch.cat(
                 [b.input_ids[:n]
@@ -1290,7 +1754,7 @@ class BatchedModelRunner(NPUModelRunner):
         ctx = _MergedAttnContext(
             merged_attn_metadata=merged_attn_metadata,
             merged_batch_descriptor=merged_batch_descriptor,
-            num_tokens_padded_merged=num_tokens_padded_merged,
+            num_tokens_padded_merged=merged_num_tokens_padded,
             merged_input_ids=merged_input_ids_ctx,
             merged_positions=merged_positions_ctx,
             merged_inputs_embeds=merged_inputs_embeds_ctx,
@@ -1298,424 +1762,3 @@ class BatchedModelRunner(NPUModelRunner):
         self._merged_attn_ctx_cache = ctx
         return ctx
 
-    def _merge_layer_attn(
-        self,
-        layer_name: str,
-        bundles: list["_ExecuteModelBundle"],
-        batched_dp_ranks: list[int],
-        per_dp_offsets: dict[int, int],
-        bpb: int,
-    ) -> Any:
-        """Merge one layer's ``AscendMetadata`` across dp_ranks.
-
-        Field-by-field strategy (see design doc §4.5):
-        - cumsum: ``query_start_loc``
-        - concat: ``seq_lens`` / ``seq_lens_cpu``
-        - concat + per-dp_rank remap: ``block_tables`` /
-          ``slot_mapping``
-        - sum / max: ``num_actual_tokens`` / ``num_decode_tokens`` /
-          ``num_prefills`` / ``num_decodes`` / ``max_query_len``
-
-        Per-dp_rank-identical fields (``attn_state`` / ``causal`` /
-        ``model_runner_type``) fall through from the first bundle.
-        """
-        from vllm_ascend.attention.attention_v1 import AscendMetadata
-
-        def _layer_md(b: "_ExecuteModelBundle") -> Any:
-            d = b.attn_metadata
-            return d[0][layer_name] if isinstance(d, list) else (
-                d[layer_name])
-
-        any_md = _layer_md(bundles[0])
-        per_layer_mds = [_layer_md(b) for b in bundles]
-
-        # Unify ``attn_state`` across dp_ranks.
-        states = [md.attn_state for md in per_layer_mds]
-        unique_states = set(states)
-        if len(unique_states) > 1:
-            if AscendAttentionState.SpecDecoding in unique_states:
-                raise NotImplementedError(
-                    f"Layer {layer_name}: cannot merge SpecDecoding "
-                    f"with other states {unique_states}; SpecDecoding "
-                    f"uses a separate tree path that the batched "
-                    f"forward does not yet support")
-            merged_attn_state = AscendAttentionState.ChunkedPrefill
-        else:
-            merged_attn_state = next(iter(unique_states))
-
-        if self._is_c8_attn_layer(layer_name):
-            raise NotImplementedError(
-                f"Layer {layer_name}: C8 (INT8 KV cache) backend "
-                "does not yet support batched forward; fall back "
-                "to per-dp_rank execution for this layer.")
-
-        for b in bundles[1:]:
-            md = _layer_md(b)
-            for f in ("causal", "model_runner_type", "attn_mask"):
-                lhs = getattr(md, f)
-                rhs = getattr(any_md, f)
-                if (isinstance(lhs, torch.Tensor)
-                        or isinstance(rhs, torch.Tensor)):
-                    if not torch.equal(lhs, rhs):
-                        raise RuntimeError(
-                            f"Layer {layer_name}: dp_rank "
-                            f"b.attn_metadata[{f!r}] disagrees across "
-                            f"dp_ranks; cannot merge for batched "
-                            f"forward")
-                elif lhs != rhs:
-                    raise RuntimeError(
-                        f"Layer {layer_name}: dp_rank "
-                        f"b.attn_metadata[{f!r}] disagrees across "
-                        f"dp_ranks; cannot merge for batched forward")
-        for f in ("prefill", "decode_meta", "reshape_cache_event",
-                  "kvcomp_metadata"):
-            if any(getattr(_layer_md(b), f) is not None
-                   for b in bundles):
-                raise NotImplementedError(
-                    f"Layer {layer_name}: {f!r} is set on at least "
-                    f"one dp_rank; batched forward does not yet "
-                    f"support merging this field.")
-
-        # 1. query_start_loc (cumsum token offsets).
-        merged_query_start_loc = [0]
-        for b in bundles:
-            md = _layer_md(b)
-            n_reqs = md.seq_lens.shape[0]
-            if n_reqs > 0:
-                local = md.query_start_loc[1:n_reqs + 1]
-                cumulative = local + merged_query_start_loc[-1]
-                merged_query_start_loc.extend(cumulative.tolist())
-            else:
-                merged_query_start_loc.append(
-                    merged_query_start_loc[-1])
-        merged_query_start_loc = torch.tensor(
-            merged_query_start_loc, dtype=torch.int32,
-            device=self.device)
-
-        # 2. seq_lens (concat).
-        merged_seq_lens = torch.cat(
-            [_layer_md(b).seq_lens for b in bundles])
-        merged_seq_lens_cpu = (
-            torch.cat([_layer_md(b).seq_lens_cpu for b in bundles])
-            if any_md.seq_lens_cpu is not None else None)
-
-        # 3. block_tables (concat + remap).
-        dp_size = self.parallel_config.data_parallel_size
-        merged_block_tables = torch.cat([
-            torch.where(
-                _layer_md(b).block_tables == 0,
-                _layer_md(b).block_tables,
-                ((_layer_md(b).block_tables // bpb) * dp_size
-                 + per_dp_offsets[k]) * bpb
-                + (_layer_md(b).block_tables % bpb),
-            )
-            for b, k in zip(bundles, batched_dp_ranks)
-        ])
-
-        # 4. slot_mapping (concat + remap).
-        bs = self.block_size
-        merged_slot_mapping = torch.cat([
-            torch.where(
-                _layer_md(b).slot_mapping == PAD_SLOT_ID,
-                _layer_md(b).slot_mapping,
-                ((_layer_md(b).slot_mapping // bs) * dp_size
-                 + per_dp_offsets[k]) * bs
-                + (_layer_md(b).slot_mapping % bs),
-            )
-            for b, k in zip(bundles, batched_dp_ranks)
-        ])
-
-        # 5. actual_seq_lengths_q (cu_seqlen of merged batch).
-        merged_actual_seq_lengths_q = (
-            merged_query_start_loc[1:].tolist())
-
-        # 6. Scalars.
-        merged_num_actual_tokens_pcp_padded = sum(
-            _layer_md(b).num_actual_tokens_pcp_padded
-            for b in bundles)
-        merged_num_actual_tokens = sum(
-            _layer_md(b).num_actual_tokens for b in bundles)
-        merged_num_decode_tokens = sum(
-            _layer_md(b).num_decode_tokens for b in bundles)
-        merged_num_prefills = sum(
-            _layer_md(b).num_prefills for b in bundles)
-        merged_num_decodes = sum(
-            _layer_md(b).num_decodes for b in bundles)
-        merged_num_decodes_flatten = sum(
-            _layer_md(b).num_decodes_flatten for b in bundles)
-        merged_max_query_len = max(
-            _layer_md(b).max_query_len or 0 for b in bundles)
-
-        return AscendMetadata(
-            num_actual_tokens_pcp_padded=(
-                merged_num_actual_tokens_pcp_padded),
-            num_actual_tokens=merged_num_actual_tokens,
-            num_decode_tokens=merged_num_decode_tokens,
-            num_prefills=merged_num_prefills,
-            num_decodes=merged_num_decodes,
-            num_decodes_flatten=merged_num_decodes_flatten,
-            seq_lens=merged_seq_lens,
-            seq_lens_cpu=merged_seq_lens_cpu,
-            seq_lens_list=merged_seq_lens.cpu().tolist(),
-            actual_seq_lengths_q=merged_actual_seq_lengths_q,
-            query_start_loc=merged_query_start_loc,
-            max_query_len=merged_max_query_len,
-            block_tables=merged_block_tables,
-            slot_mapping=merged_slot_mapping,
-            attn_mask=any_md.attn_mask,
-            attn_state=merged_attn_state,
-            causal=any_md.causal,
-            model_runner_type=any_md.model_runner_type,
-        )
-
-    def _merge_gdn_layer_attn(
-        self,
-        layer_name: str,
-        bundles: list["_ExecuteModelBundle"],
-        batched_dp_ranks: list[int],
-        per_dp_offsets: dict[int, int],
-        bpb: int,
-    ) -> Any:
-        """Merge one layer's ``GDNAttentionMetadata`` across dp_ranks.
-
-        See ``non_embedding_only_support.md`` §3 for the 21-field
-        strategy (scalar sums, per-request cat, cu_seqlen cumsum
-        with offset, token-indices shift, mamba state-indices
-        remap, derived-from-cu_seqlen fallback).
-        """
-        from vllm.v1.attention.backends.gdn_attn import (
-            GDNAttentionMetadata,
-        )
-
-        def _layer_md(b: "_ExecuteModelBundle") -> Any:
-            d = b.attn_metadata
-            return d[0][layer_name] if isinstance(d, list) else (
-                d[layer_name])
-
-        any_md = _layer_md(bundles[0])
-        per_layer_mds = [_layer_md(b) for b in bundles]
-
-        # A. scalar sums.
-        merged_num_prefills = sum(
-            _layer_md(b).num_prefills for b in bundles)
-        merged_num_prefill_tokens = sum(
-            _layer_md(b).num_prefill_tokens for b in bundles)
-        merged_num_decodes = sum(
-            _layer_md(b).num_decodes for b in bundles)
-        merged_num_decode_tokens = sum(
-            _layer_md(b).num_decode_tokens for b in bundles)
-        merged_num_spec_decodes = sum(
-            _layer_md(b).num_spec_decodes for b in bundles)
-        merged_num_spec_decode_tokens = sum(
-            _layer_md(b).num_spec_decode_tokens for b in bundles)
-        merged_num_actual_tokens = sum(
-            _layer_md(b).num_actual_tokens for b in bundles)
-
-        # B. per-request tensors (concat dim=0).
-        def _cat_or_none(getter):
-            values = [getter(_layer_md(b)) for b in bundles]
-            if all(v is None for v in values):
-                return None
-            if any(v is None for v in values):
-                raise NotImplementedError(
-                    f"Layer {layer_name}: field is None on some "
-                    f"dp_ranks and non-None on others; batched "
-                    f"forward requires uniform None-ness.")
-            return torch.cat(values)
-
-        device = self.device
-        parts: list[torch.Tensor] = []
-        for md in per_layer_mds:
-            n_non_spec = md.num_decodes + md.num_prefills
-            if md.has_initial_state is not None:
-                parts.append(md.has_initial_state)
-            elif n_non_spec > 0:
-                parts.append(
-                    torch.ones(n_non_spec, dtype=torch.bool,
-                               device=device))
-        merged_has_initial_state = (
-            torch.cat(parts) if parts else None)
-        merged_spec_sequence_masks = _cat_or_none(
-            lambda md: md.spec_sequence_masks)
-        merged_num_accepted_tokens = _cat_or_none(
-            lambda md: md.num_accepted_tokens)
-
-        # E. mamba state indices (cat, with block_id remap).
-        dp_size = self.parallel_config.data_parallel_size
-
-        def _remap_state_indices(getter):
-            values = [getter(_layer_md(b)) for b in bundles]
-            if all(v is None for v in values):
-                return None
-            if any(v is None for v in values):
-                raise NotImplementedError(
-                    f"Layer {layer_name}: state indices are None on "
-                    f"some dp_ranks and non-None on others; batched "
-                    f"forward requires uniform None-ness.")
-            return torch.cat([
-                ((v // bpb) * dp_size + per_dp_offsets[k]) * bpb
-                + (v % bpb)
-                for v, k in zip(values, batched_dp_ranks)
-            ])
-
-        merged_spec_state_indices_tensor = _remap_state_indices(
-            lambda md: md.spec_state_indices_tensor)
-        merged_non_spec_state_indices_tensor = _remap_state_indices(
-            lambda md: md.non_spec_state_indices_tensor)
-
-        # D. token indices (cat + prior_token_count offset).
-        prior_token_count = 0
-        spec_token_indx_parts = []
-        non_spec_token_indx_parts = []
-        for b in bundles:
-            md = _layer_md(b)
-            if md.spec_token_indx is not None:
-                spec_token_indx_parts.append(
-                    md.spec_token_indx + prior_token_count)
-            if md.non_spec_token_indx is not None:
-                non_spec_token_indx_parts.append(
-                    md.non_spec_token_indx + prior_token_count)
-            prior_token_count += md.num_actual_tokens
-        merged_spec_token_indx = (
-            torch.cat(spec_token_indx_parts)
-            if spec_token_indx_parts else None)
-        merged_non_spec_token_indx = (
-            torch.cat(non_spec_token_indx_parts)
-            if non_spec_token_indx_parts else None)
-
-        # C. cu_seqlen-style (cumsum concat with prior offset).
-        prior_spec_count = 0
-        spec_qsl_parts = []
-        for b in bundles:
-            md = _layer_md(b)
-            if md.spec_query_start_loc is None:
-                continue
-            n = md.num_spec_decodes
-            if n > 0:
-                local = md.spec_query_start_loc[1:n + 1]
-                spec_qsl_parts.append(local + prior_spec_count)
-                prior_spec_count += int(
-                    md.spec_query_start_loc[n].item())
-        if spec_qsl_parts or any(
-                _layer_md(b).spec_query_start_loc is None
-                for b in bundles):
-            merged_spec_query_start_loc = (
-                torch.cat(
-                    [torch.zeros(1, dtype=torch.int32,
-                                 device=self.device)]
-                    + spec_qsl_parts)
-                if spec_qsl_parts else None)
-        else:
-            merged_spec_query_start_loc = None
-
-        prior_non_spec_count = 0
-        non_spec_qsl_parts = []
-        for b in bundles:
-            md = _layer_md(b)
-            if md.non_spec_query_start_loc is None:
-                continue
-            n = md.num_decodes + md.num_prefills
-            if n > 0:
-                local = md.non_spec_query_start_loc[1:n + 1]
-                non_spec_qsl_parts.append(
-                    local + prior_non_spec_count)
-                prior_non_spec_count += int(
-                    md.non_spec_query_start_loc[n].item())
-        merged_non_spec_query_start_loc = (
-            torch.cat(
-                [torch.zeros(1, dtype=torch.int32,
-                             device=self.device)]
-                + non_spec_qsl_parts)
-            if non_spec_qsl_parts else None)
-
-        # F-class: leave as None (the patched Ascend forward path
-        # reads the ``*_fallback_meta`` set by the sub-patchers below,
-        # not these dataclass fields).
-        merged_chunk_indices = None
-        merged_chunk_offsets = None
-        merged_nums_dict = None
-        merged_batch_ptr = None
-        merged_token_chunk_offset_ptr = None
-
-        # Run the three ``_patched_build_*`` sub-patchers (mirrors
-        # ``_patched_build`` patch_gdn_attn.py:709-750).
-        if (merged_num_prefills > 0 or merged_num_decodes > 0
-                or merged_num_spec_decodes > 0):
-            from vllm_ascend.patch.worker.patch_gdn_attn import (
-                _patched_build_decode,
-                _patched_build_prefill,
-                _patched_build_spec,
-            )
-
-            builder = None
-            for attn_group_list in self.attn_groups:
-                for attn_group in attn_group_list:
-                    if layer_name in attn_group.layer_names:
-                        builder = attn_group.get_metadata_builder(0)
-                        break
-                if builder is not None:
-                    break
-            assert builder is not None, (
-                f"GDN builder not found for layer {layer_name!r}")
-
-            # Reconstruct merged full cu_seqlen (non-spec first,
-            # then spec — matches ``argsort(spec_token_masks,
-            # stable=True)`` ordering in ``_ORIGINAL_BUILD``
-            # gdn_attn.py:271).
-            n_non_spec = merged_num_decodes + merged_num_prefills
-            non_spec_cumsum_cpu = (
-                merged_non_spec_query_start_loc.cpu())
-            if merged_spec_query_start_loc is not None:
-                spec_cumsum_cpu = (
-                    merged_spec_query_start_loc.cpu())
-                merged_full_cumsum_cpu = torch.cat([
-                    non_spec_cumsum_cpu,
-                    spec_cumsum_cpu[1:] + non_spec_cumsum_cpu[-1],
-                ])
-            else:
-                merged_full_cumsum_cpu = non_spec_cumsum_cpu
-            # Per-req spec flag: ``-1`` non-spec, ``0`` spec.
-            merged_nddt_cpu = torch.cat([
-                torch.full((n_non_spec,), -1, dtype=torch.int32),
-                torch.zeros(merged_num_spec_decodes,
-                            dtype=torch.int32),
-            ])
-
-            common_stub = _StubCommonAttnMetadata(
-                query_start_loc=torch.empty(0, device=self.device),
-                query_start_loc_cpu=merged_full_cumsum_cpu,
-                num_decode_draft_tokens_cpu=merged_nddt_cpu,
-            )
-
-        attn_metadata = GDNAttentionMetadata(
-            num_prefills=merged_num_prefills,
-            num_prefill_tokens=merged_num_prefill_tokens,
-            num_decodes=merged_num_decodes,
-            num_decode_tokens=merged_num_decode_tokens,
-            num_spec_decodes=merged_num_spec_decodes,
-            num_spec_decode_tokens=merged_num_spec_decode_tokens,
-            num_actual_tokens=merged_num_actual_tokens,
-            has_initial_state=merged_has_initial_state,
-            spec_query_start_loc=merged_spec_query_start_loc,
-            non_spec_query_start_loc=merged_non_spec_query_start_loc,
-            spec_state_indices_tensor=merged_spec_state_indices_tensor,
-            non_spec_state_indices_tensor=(
-                merged_non_spec_state_indices_tensor),
-            spec_sequence_masks=merged_spec_sequence_masks,
-            spec_token_indx=merged_spec_token_indx,
-            non_spec_token_indx=merged_non_spec_token_indx,
-            num_accepted_tokens=merged_num_accepted_tokens,
-            chunk_indices=merged_chunk_indices,
-            chunk_offsets=merged_chunk_offsets,
-            nums_dict=merged_nums_dict,
-            batch_ptr=merged_batch_ptr,
-            token_chunk_offset_ptr=merged_token_chunk_offset_ptr,
-        )
-        if merged_num_spec_decodes > 0:
-            _patched_build_spec(builder, attn_metadata, common_stub)
-        if merged_num_prefills > 0:
-            _patched_build_prefill(builder, attn_metadata, common_stub)
-        if merged_num_decodes > 0:
-            _patched_build_decode(builder, attn_metadata, common_stub)
-        attn_metadata.skip_graph_params_update = True
-        return attn_metadata

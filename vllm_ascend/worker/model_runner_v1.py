@@ -4932,6 +4932,9 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_across_dp,
             cudagraph_stats,
         )
+    
+    def _should_save_for_attn_metadata(self) -> bool:
+        return False
 
     def _build_attention_metadata(
         self,
@@ -5122,6 +5125,9 @@ class NPUModelRunner(GPUModelRunner):
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(logits_indices)
 
+        if self._should_save_for_attn_metadata():
+            self.cm_base = cm_base
+        
         def _build_attn_group_metadata(
             kv_cache_gid: int,
             attn_gid: int,
@@ -5165,6 +5171,9 @@ class NPUModelRunner(GPUModelRunner):
                         common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                         block_size=attn_group.kv_cache_spec.block_size,
                         )
+            if self._should_save_for_attn_metadata():
+                self.per_gid_extra[(kv_cache_gid, attn_gid)] = (
+                    cascade_attn_prefix_len, extra_attn_metadata_args)
 
             # add kvcomp_metadata into common_attn_metadata
             if (for_cudagraph_capture
@@ -5203,6 +5212,15 @@ class NPUModelRunner(GPUModelRunner):
         decode_ratio_to_sas_metadata: dict[Any, Any] = {}
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
+        
+        if self._should_save_for_attn_metadata():
+            self.per_gid_cm = [{} for _ in self.kv_cache_config.kv_cache_groups]
+            self.per_gid_extra = {}
+
+        def _save(name: str):
+            if self._should_save_for_attn_metadata():
+                self.per_gid_cm[kv_cache_gid][name] = getattr(cm, name)
+        
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
@@ -5212,6 +5230,9 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_group.kv_cache_spec,
                 num_reqs_padded,
             )
+
+            _save('encoder_seq_lens')
+            _save('encoder_seq_lens_cpu')
 
             # Now, query_start_loc is padded.
             # But gdn needs an unpadded one.
@@ -5223,10 +5244,14 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(builder, GDNAttentionMetadataBuilder):
                     cm.query_start_loc_cpu = self.gdn_query_start_loc.cpu[: num_reqs_padded + 1]
                     cm.query_start_loc = self.gdn_query_start_loc.gpu[: num_reqs_padded + 1]
+                    _save('query_start_loc_cpu')
+                    _save('query_start_loc')
 
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
+                _save('block_table_tensor')
+                _save('slot_mapping')
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
