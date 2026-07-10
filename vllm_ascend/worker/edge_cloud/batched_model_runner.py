@@ -1049,6 +1049,46 @@ class BatchedModelRunner(NPUModelRunner):
             cudagraph_mode = any_bundle.cudagraph_mode
             num_tokens_padded_merged = sum(
                 b.num_tokens_padded for b in bundles)
+        # FULL mode: copy ``intermediate_tensors`` to leader
+        # runner's pre-allocated buffer so ``seg_e`` (which is
+        # ``ACLGraphWrapper``-wrapped) reads from a stable
+        # device pointer across cudagraph captures. The
+        # pre-allocated buffer is lazily created here (same
+        # factory as NPUModelRunner's ``execute_model`` path)
+        # so we don't depend on ``execute_model`` having run
+        # first. The buffer is sized to ``self.max_num_tokens``
+        # (the per-dp_rank max); cudagraph dispatch clamps the
+        # merged padded size to within this bound, so the
+        # buffer is always large enough.
+        if cudagraph_mode == CUDAGraphMode.FULL:
+            if self.intermediate_tensors is None:
+                self.intermediate_tensors = (
+                    self.model.make_empty_intermediate_tensors(
+                        batch_size=self.max_num_tokens,
+                        dtype=self.dtype,
+                        device=self.device,
+                    ))
+            for k, v in merged_intermediate.items():
+                if not isinstance(v, torch.Tensor):
+                    continue
+                # Pad the tail (beyond ``merged_num_actual``)
+                # up to ``merged_num_tokens_padded`` with 0 so
+                # the pre-allocated buffer's padding carries a
+                # deterministic value (instead of whatever stale
+                # bytes were left from a previous round).
+                if v.shape[0] < num_tokens_padded_merged:
+                    pad_shape = list(v.shape)
+                    pad_shape[0] = (
+                        num_tokens_padded_merged - v.shape[0])
+                    pad = torch.zeros(
+                        pad_shape, dtype=v.dtype, device=v.device)
+                    v = torch.cat([v, pad], dim=0)
+                elif v.shape[0] > num_tokens_padded_merged:
+                    v = v[:num_tokens_padded_merged]
+                dst = self.intermediate_tensors[k][
+                    :num_tokens_padded_merged]
+                dst.copy_(v, non_blocking=True)
+                merged_intermediate[k] = dst
         kv_connector_output = None
         num_tokens_merged = sum(n_actuals_tail)
         num_tokens_across_dp_merged = None
@@ -1318,10 +1358,13 @@ class BatchedModelRunner(NPUModelRunner):
         if (merged_query_start_loc_cpu.shape[0] - 1
                 < merged_num_reqs_padded):
             last = merged_query_start_loc_cpu[-1].item()
-            pad = torch.full(
-                (merged_num_reqs_padded + 1
-                 - merged_query_start_loc_cpu.shape[0],),
-                last, dtype=torch.int32, device="cpu")
+            if merged_num_tokens_padded == merged_num_reqs_padded * self.uniform_decode_query_len:
+                pad = torch.arange(1, merged_num_reqs_padded + 1 - merged_num_reqs, dtype=torch.int32, device="cpu")
+            else:
+                pad = torch.full(
+                    (merged_num_reqs_padded + 1
+                    - merged_query_start_loc_cpu.shape[0],),
+                    last, dtype=torch.int32, device="cpu")
             merged_query_start_loc_cpu = torch.cat(
                 [merged_query_start_loc_cpu, pad])
         elif (merged_query_start_loc_cpu.shape[0] - 1
@@ -1330,6 +1373,16 @@ class BatchedModelRunner(NPUModelRunner):
                 :merged_num_reqs_padded + 1]
         merged_query_start_loc = merged_query_start_loc_cpu.to(
             self.device)
+        # FULL mode: copy merged NPU tensor to leader runner's
+        # pre-allocated buffer so ``cm_merged.query_start_loc`` (a
+        # slice view of this buffer) has a stable device pointer
+        # across cudagraph captures. Non-FULL modes can use the
+        # freshly-allocated ``merged_query_start_loc`` directly.
+        if merged_cudagraph_mode == CUDAGraphMode.FULL:
+            self.query_start_loc.gpu[
+                :merged_num_reqs_padded + 1].copy_(merged_query_start_loc)
+            merged_query_start_loc = (
+                self.query_start_loc.gpu[:merged_num_reqs_padded + 1])
 
         # ---- Step 4: merged per-req fields via unpad-cat-pad.
         def _cat_per_req_pad(get_field, pad_value, dtype,
@@ -1382,10 +1435,14 @@ class BatchedModelRunner(NPUModelRunner):
             "cpu") if any(cm.num_computed_tokens_cpu is not None
                           for cm in cms_unpadded) else None
         # ``is_prefilling``: pad value is False (matches
-        # ``_build_attention_metadata`` line 4378).
+        # ``_build_attention_metadata`` line 4378). The tensor
+        # itself is on CPU (built by comparing the CPU
+        # ``num_computed_tokens_cpu_tensor`` /
+        # ``num_prompt_tokens_cpu_tensor``), so the merged tensor
+        # also lives on CPU.
         merged_is_prefilling = _cat_per_req_pad(
             lambda cm: cm.is_prefilling, False,
-            torch.bool, self.device)
+            torch.bool, "cpu")
         if merged_is_prefilling is not None:
             merged_is_prefilling[merged_num_reqs:] = False
 
@@ -1411,6 +1468,16 @@ class BatchedModelRunner(NPUModelRunner):
                   > merged_num_tokens_padded):
                 merged_positions = merged_positions[
                     ..., :merged_num_tokens_padded]
+            # FULL mode: copy to leader runner's pre-allocated
+            # ``self.positions`` buffer so ``cm_merged.positions``
+            # (a slice view of this buffer) and
+            # ``_model_forward(positions=...)`` share a stable
+            # device pointer across cudagraph captures.
+            if merged_cudagraph_mode == CUDAGraphMode.FULL:
+                self.positions[:merged_num_tokens_padded].copy_(
+                    merged_positions)
+                merged_positions = (
+                    self.positions[:merged_num_tokens_padded])
         else:
             merged_positions = None
         if all(cm.positions_cpu is not None for cm in cms_unpadded):
@@ -1460,7 +1527,7 @@ class BatchedModelRunner(NPUModelRunner):
 
         # ---- Step 5: per-(kv_cache_gid, attn_gid) build.
         merged_attn_metadata: dict = {}
-        from vllm_ascend.patch.worker.patch_gdn_attn import (
+        from vllm.v1.attention.backends.gdn_attn import (
             GDNAttentionMetadataBuilder,
         )
         for kv_cache_gid in range(num_kv_cache_gids):
@@ -1512,6 +1579,19 @@ class BatchedModelRunner(NPUModelRunner):
                       > merged_num_reqs_padded):
                     merged_block_tables = merged_block_tables[
                         :merged_num_reqs_padded]
+                # FULL mode: copy to leader runner's pre-allocated
+                # per-gid block_table buffer so ``cm_merged``
+                # (a slice view of this buffer) has a stable
+                # device pointer across cudagraph captures.
+                if merged_cudagraph_mode == CUDAGraphMode.FULL:
+                    self.input_batch.block_table[
+                        kv_cache_gid].block_table.gpu[
+                            :merged_num_reqs_padded].copy_(
+                                merged_block_tables)
+                    merged_block_tables = (
+                        self.input_batch.block_table[
+                            kv_cache_gid].block_table.gpu[
+                                :merged_num_reqs_padded])
 
                 # Per-gid slot_mapping.
                 parts_sm = []
@@ -1545,6 +1625,19 @@ class BatchedModelRunner(NPUModelRunner):
                       > merged_num_tokens_padded):
                     merged_slot_mapping = merged_slot_mapping[
                         :merged_num_tokens_padded]
+                # FULL mode: copy to leader runner's pre-allocated
+                # per-gid slot_mapping buffer so ``cm_merged``
+                # (a slice view of this buffer) has a stable
+                # device pointer across cudagraph captures.
+                if merged_cudagraph_mode == CUDAGraphMode.FULL:
+                    self.input_batch.block_table[
+                        kv_cache_gid].slot_mapping.gpu[
+                            :merged_num_tokens_padded].copy_(
+                                merged_slot_mapping)
+                    merged_slot_mapping = (
+                        self.input_batch.block_table[
+                            kv_cache_gid].slot_mapping.gpu[
+                                :merged_num_tokens_padded])
 
                 # Per-gid encoder_seq_lens / encoder_seq_lens_cpu.
                 def _cat_per_gid_per_req(field_name, pad_value):
@@ -1747,20 +1840,42 @@ class BatchedModelRunner(NPUModelRunner):
                  for b, n in zip(bundles, n_actuals)])
         else:
             merged_input_ids_ctx = None
-        if all(b.positions is not None for b in bundles):
-            cat_dim_ctx = bundles[0].positions.dim() - 1
-            merged_positions_ctx = torch.cat(
-                [b.positions[..., :n]
-                 for b, n in zip(bundles, n_actuals)],
-                dim=cat_dim_ctx)
-        else:
-            merged_positions_ctx = None
         if all(b.inputs_embeds is not None for b in bundles):
             merged_inputs_embeds_ctx = torch.cat(
                 [b.inputs_embeds[:n]
                  for b, n in zip(bundles, n_actuals)])
         else:
             merged_inputs_embeds_ctx = None
+        # FULL mode: copy ``input_ids`` / ``inputs_embeds`` to
+        # leader runner's pre-allocated buffers so
+        # ``_model_forward(input_ids=..., inputs_embeds=...)``
+        # share stable device pointers across cudagraph
+        # captures. ``positions`` was already copied in Step 4
+        # (FULL mode path) — reuse ``self.positions[:n]`` here
+        # instead of re-cating.
+        if merged_cudagraph_mode == CUDAGraphMode.FULL:
+            if merged_input_ids_ctx is not None:
+                # Pad the tail (beyond ``merged_num_actual_tokens``)
+                # with 0 so the pre-allocated buffer's padding
+                # carries a deterministic value instead of
+                # whatever stale bytes were left from a previous
+                # round. The leading actual rows are then
+                # overwritten with the merged cat output.
+                self.input_ids.gpu[
+                    merged_num_actual_tokens:merged_num_tokens_padded
+                ].fill_(0)
+                self.input_ids.gpu[:merged_num_actual_tokens].copy_(
+                    merged_input_ids_ctx)
+                merged_input_ids_ctx = (
+                    self.input_ids.gpu[:merged_num_tokens_padded])
+            if merged_inputs_embeds_ctx is not None:
+                self.inputs_embeds.gpu[
+                    merged_num_actual_tokens:merged_num_tokens_padded
+                ].fill_(0)
+                self.inputs_embeds.gpu[:merged_num_actual_tokens].copy_(
+                    merged_inputs_embeds_ctx)
+                merged_inputs_embeds_ctx = (
+                    self.inputs_embeds.gpu[:merged_num_tokens_padded])
 
         ctx = _MergedAttnContext(
             merged_attn_metadata=merged_attn_metadata,
@@ -1768,7 +1883,7 @@ class BatchedModelRunner(NPUModelRunner):
             merged_cudagraph_mode=merged_cudagraph_mode,
             num_tokens_padded_merged=merged_num_tokens_padded,
             merged_input_ids=merged_input_ids_ctx,
-            merged_positions=merged_positions_ctx,
+            merged_positions=merged_positions,
             merged_inputs_embeds=merged_inputs_embeds_ctx,
         )
         self._merged_attn_ctx_cache = ctx
