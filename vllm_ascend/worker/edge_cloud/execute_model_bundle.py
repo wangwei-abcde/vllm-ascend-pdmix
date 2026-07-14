@@ -206,3 +206,39 @@ class _MergedAttnContext:
     merged_input_ids: torch.Tensor | None
     merged_positions: torch.Tensor | None
     merged_inputs_embeds: torch.Tensor | None
+
+    # Decode-first reorder state.
+    #
+    # The batched merge cat's per-req fields in the order of
+    # ``bundles`` (== ``batched_dp_ranks`` order). Many attention
+    # builders (notably ``GDNAttentionMetadataBuilder``) call
+    # ``split_decodes_and_prefills`` which assumes the batch is
+    # already in decode-first order
+    # (``first_prefill = argmax(is_prefill)`` gives ``num_decodes``
+    # directly). Per-dp_rank ``_may_reorder_batch`` only sorts
+    # INSIDE a single dp_rank; the merged batch still needs a
+    # global decode-first reorder so the attention kernel's
+    # decode/prefill split matches the merged layout.
+    #
+    # Both perm tensors are ``None`` iff the merged batch is
+    # decode-only (``merged_attn_state == DecodeOnly``) and the
+    # reorder is a no-op — in that case the cat-order layout
+    # IS the decode-first layout, so the head/tail stages skip
+    # every per-token permute / un-permute work below.
+    # Otherwise ``merged_token_perm`` has shape
+    # ``[merged_num_actual_tokens]`` (CPU int64) and maps a
+    # cat-order token index to its reordered position; used by
+    # the tail stage to rewrite ``merged_logits_indices`` so
+    # that ``merged_sample_hidden_states = hidden_states[indices]``
+    # still picks the right rows after the per-token reorder.
+    merged_token_perm: torch.Tensor | None
+    # ``None`` when ``merged_token_perm`` is ``None``;
+    # otherwise shape ``[merged_num_actual_tokens]`` (CPU int64)
+    # mapping a reordered token index back to its cat-order
+    # index. Used by tail stage to un-permute ``merged_hidden``
+    # so the worker can slice per-dp_rank with the original
+    # cat-order ``token_offsets`` and feed
+    # ``execute_model_post_batched`` with a tensor in the same
+    # per-dp_rank local layout that ``bundle[i].logits_indices``
+    # expects.
+    inv_merged_token_perm: torch.Tensor | None
