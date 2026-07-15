@@ -268,7 +268,7 @@ class PassiveScheduler:
             except queue.Empty:
                 break
             hc = getattr(scheduler_output, "hidden_channel", None)
-            print(f"[CLOUD-ZMQ-RCV] rank={torch.distributed.get_rank()}, "
+            print(f"[CLOUD-ZMQ-RCV] pid={os.getpid()}, "
                   f"batch_type={scheduler_output.batch_type.name}, "
                   f"hidden_channel={hc}, "
                   f"num_tokens={scheduler_output.total_num_scheduled_tokens}, "

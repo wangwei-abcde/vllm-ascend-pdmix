@@ -64,6 +64,7 @@ source and re-apply the dest-only inserts.
 from __future__ import annotations
 
 import functools
+import os
 from concurrent.futures import Future
 from typing import cast
 from uuid import uuid4
@@ -268,7 +269,7 @@ def _publish_pre_out_when_ready(self) -> None:
     ch.publish(oldest_so)
     published.add(head_token)
     hc = getattr(oldest_so, "hidden_channel", None)
-    print(f"[EDGE-ZMQ-PUB] rank={torch.distributed.get_rank()}, "
+    print(f"[EDGE-ZMQ-PUB] pid={os.getpid()}, "
           f"batch_type={oldest_so.batch_type.name}, "
           f"hidden_channel={hc}, "
           f"head_token={head_token}, "
