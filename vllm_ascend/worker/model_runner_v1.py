@@ -2777,6 +2777,10 @@ class NPUModelRunner(GPUModelRunner):
                     self._cloud_spec_decode_common_attn_metadata = spec_decode_common_attn_metadata
                     self._cloud_spec_decode_num_reqs = num_reqs
 
+            import torch as _torch_pre
+            print(f"[RUNNER-PREPROC] rank={_torch_pre.distributed.get_rank()}, "
+                  f"has_intermediate={intermediate_tensors is not None}, "
+                  f"num_tokens_padded={num_tokens_padded}", flush=True)
             (
                 input_ids,
                 inputs_embeds,
@@ -2791,6 +2795,8 @@ class NPUModelRunner(GPUModelRunner):
                 else total_num_scheduled_tokens,
                 intermediate_tensors,
             )
+            print(f"[RUNNER-PREPROC-OK] rank={_torch_pre.distributed.get_rank()}, "
+                  f"has_intermediate={intermediate_tensors is not None}", flush=True)
 
             if not self.edge_cloud_cfg.role == "edge":
                 # update global cos, sin
@@ -2895,11 +2901,16 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            import torch as _torch_fwd
+            print(f"[RUNNER-FWD] rank={_torch_fwd.distributed.get_rank()}, "
+                  f"slice={layer_slice_info}, num_tokens_padded={num_tokens_padded}", flush=True)
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors,
                 inputs_embeds, layer_slice_info=layer_slice_info,
                 **model_kwargs
             )
+            print(f"[RUNNER-FWD-OK] rank={_torch_fwd.distributed.get_rank()}, "
+                  f"slice={layer_slice_info}", flush=True)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
