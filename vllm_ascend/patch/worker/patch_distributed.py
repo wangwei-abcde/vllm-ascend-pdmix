@@ -276,6 +276,11 @@ class GroupCoordinatorPatch(GroupCoordinator):
         # Iterate over ALL subgroups so that every rank participates in
         # every new_group call (required because new_group is collective
         # on the default group).  Only save the group this rank belongs to.
+        print(
+            f"[HCCL-CHANNEL] rank={self.rank} create_alternate_groups "
+            f"_all_group_ranks={self._all_group_ranks}",
+            flush=True,
+        )
         for ranks in self._all_group_ranks:
             alt_device_group = torch.distributed.new_group(
                 ranks,
@@ -309,6 +314,11 @@ class GroupCoordinatorPatch(GroupCoordinator):
         hccl_pg_options = create_hccl_pg_options("pp_prefill2")
         prefill2_device_group = None
         prefill2_cpu_group = None
+        print(
+            f"[HCCL-CHANNEL] rank={self.rank} create_hidden_channel_groups "
+            f"_all_group_ranks={self._all_group_ranks}",
+            flush=True,
+        )
         for ranks in self._all_group_ranks:
             device_group = torch.distributed.new_group(
                 ranks,

@@ -363,6 +363,14 @@ def init_ascend_model_parallel(
         # mode.  The default PP group is PREFILL_1, the alternate PP group is
         # DECODE, and the extra hidden-channel group is PREFILL_2.
         pp_group = get_pp_group()
+        print(
+            f"[HCCL-CHANNEL] rank={torch.distributed.get_rank()} "
+            f"pp_group.ranks={pp_group.ranks} "
+            f"pp_group.world_size={pp_group.world_size} "
+            f"pp_group.rank_in_group={pp_group.rank_in_group} "
+            f"pp_group._all_group_ranks={pp_group._all_group_ranks}",
+            flush=True,
+        )
         if pp_group.world_size > 1:
             pp_group.create_alternate_groups(backend)
             if hasattr(pp_group, "create_hidden_channel_groups"):
