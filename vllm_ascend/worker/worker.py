@@ -639,6 +639,13 @@ class NPUWorker(WorkerBase):
             _gathered = output.tensors
         if get_pp_group().world_size == 2:
             channel = self._hidden_channel_for(scheduler_output)
+            pp_ranks = get_pp_group().ranks
+            print(f"[EDGE-SEND] rank={torch.distributed.get_rank()}, "
+                  f"batch_type={scheduler_output.batch_type.name}, "
+                  f"channel={channel.value}, "
+                  f"pp_ranks={pp_ranks}, "
+                  f"num_tokens={scheduler_output.total_num_scheduled_tokens}, "
+                  f"hidden_channel_from_sched={scheduler_output.hidden_channel}", flush=True)
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
                                             num_tokens=scheduler_output.total_num_scheduled_tokens),
@@ -664,11 +671,21 @@ class NPUWorker(WorkerBase):
         """Edge tail segment (PL/DL): recv -> segment_e -> return output."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         channel = self._hidden_channel_for(scheduler_output)
+        pp_ranks = get_pp_group().ranks
+        print(f"[EDGE-TAIL-RECV] rank={torch.distributed.get_rank()}, "
+              f"batch_type={scheduler_output.batch_type.name}, "
+              f"channel={channel.value}, "
+              f"pp_ranks={pp_ranks}, "
+              f"num_tokens={scheduler_output.total_num_scheduled_tokens}, "
+              f"hidden_channel_from_sched={scheduler_output.hidden_channel}", flush=True)
         tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
             num_tokens=scheduler_output.total_num_scheduled_tokens,
             channel=channel,
             sp_chunk=edge_sp and edge_merge,
         )
+        print(f"[EDGE-TAIL-RECV-OK] rank={torch.distributed.get_rank()}, "
+              f"channel={channel.value}, "
+              f"batch_type={scheduler_output.batch_type.name}", flush=True)
         logger.info(f"Receive intermediate tensors from cloud after, hidden_channel: {channel.value}")
 
         if edge_sp and not edge_merge:
@@ -734,6 +751,13 @@ class NPUWorker(WorkerBase):
                 or not self.model_runner.supports_mm_inputs)
             merge_payload = get_edge_cloud_tensor_meta().merge_payload
             channel = self._hidden_channel_for(scheduler_output)
+            pp_ranks = get_pp_group().ranks
+            print(f"[CLOUD-RECV] rank={torch.distributed.get_rank()}, "
+                  f"batch_type={scheduler_output.batch_type.name}, "
+                  f"channel={channel.value}, "
+                  f"pp_ranks={pp_ranks}, "
+                  f"num_tokens={scheduler_output.total_num_scheduled_tokens}, "
+                  f"hidden_channel_from_sched={scheduler_output.hidden_channel}", flush=True)
             # In the shared-model edge-cloud topology the edge
             # has a single distributed rank at in-group rank 0;
             # the cloud first-worker of each dp_rank must
@@ -749,6 +773,9 @@ class NPUWorker(WorkerBase):
                 sp_chunk=do_sp_chunk and merge_payload,
                 src=0,
             )
+            print(f"[CLOUD-RECV-OK] rank={torch.distributed.get_rank()}, "
+                  f"channel={channel.value}, "
+                  f"batch_type={scheduler_output.batch_type.name}", flush=True)
             logger.info(f"Received intermediate tensors from edge, hidden_channel={channel.value}")
 
             self.model_runner.cloud_prepare_early(scheduler_output)
@@ -800,6 +827,10 @@ class NPUWorker(WorkerBase):
         # 0, not the slot after the cloud.
         if get_pp_group().world_size > 1:
             channel = self._hidden_channel_for(scheduler_output)
+            print(f"[CLOUD-SEND-BACK] rank={torch.distributed.get_rank()}, "
+                  f"channel={channel.value}, "
+                  f"batch_type={scheduler_output.batch_type.name}, "
+                  f"dst=0", flush=True)
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
                                             num_tokens=scheduler_output.total_num_scheduled_tokens,

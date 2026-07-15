@@ -267,6 +267,12 @@ class PassiveScheduler:
                 seq, scheduler_output = self._inbox.get_nowait()
             except queue.Empty:
                 break
+            hc = getattr(scheduler_output, "hidden_channel", None)
+            print(f"[CLOUD-ZMQ-RCV] rank={torch.distributed.get_rank()}, "
+                  f"batch_type={scheduler_output.batch_type.name}, "
+                  f"hidden_channel={hc}, "
+                  f"num_tokens={scheduler_output.total_num_scheduled_tokens}, "
+                  f"seq={seq}", flush=True)
             self._remember_arrival_seq(scheduler_output, seq)
             bt = scheduler_output.batch_type
             logger.info(

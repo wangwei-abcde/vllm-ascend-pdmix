@@ -267,6 +267,12 @@ def _publish_pre_out_when_ready(self) -> None:
 
     ch.publish(oldest_so)
     published.add(head_token)
+    hc = getattr(oldest_so, "hidden_channel", None)
+    print(f"[EDGE-ZMQ-PUB] rank={torch.distributed.get_rank()}, "
+          f"batch_type={oldest_so.batch_type.name}, "
+          f"hidden_channel={hc}, "
+          f"head_token={head_token}, "
+          f"num_scheduled_tokens={oldest_so.total_num_scheduled_tokens}", flush=True)
     logger.info(
         "[PRE_OUT] Published PREFILL_FIRST (head_token=%s) when it became next to execute, "
         "queue_len=%d",
