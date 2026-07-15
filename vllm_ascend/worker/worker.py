@@ -793,10 +793,15 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
+        print(f"[CLOUD-FWD] rank={torch.distributed.get_rank()}, "
+              f"batch_type={scheduler_output.batch_type.name}, "
+              f"slice={layer_slice_info}", flush=True)
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors,
             layer_slice_info=layer_slice_info,
         )
+        print(f"[CLOUD-FWD-OK] rank={torch.distributed.get_rank()}, "
+              f"batch_type={scheduler_output.batch_type.name}", flush=True)
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}, after.")
 
         is_last_slice = (
