@@ -724,6 +724,16 @@ class SharedModelEdgeWorker(NPUWorker):
                 handle.wait()
             self._pp_send_work = []
 
+        phase = self._get_batch_phase(scheduler_output)
+        logger.info(
+            "[SchedulerOutput-SharedEdge] local_rank=%s phase=%s | "
+            "total_num_scheduled_tokens=%s num_reqs=%s",
+            self.local_rank,
+            phase,
+            scheduler_output.total_num_scheduled_tokens,
+            len(scheduler_output.num_scheduled_tokens),
+        )
+
         # SharedModelEdgeWorker always sits at PP rank 0 (the edge is
         # the first stage of the shared PP group), so there is no
         # upstream PP receive before the first forward.
@@ -751,6 +761,15 @@ class SharedModelEdgeWorker(NPUWorker):
         # because the edge sits at in-group rank 0 — without it every
         # virtual worker would send to in-group rank 1, which is only
         # correct for the first virtual worker.
+        logger.info(
+            "[EdgeCloud-SEND-SharedEdge] EDGE --> CLOUD | %s | "
+            "local_rank=%s dp_rank=%s num_tokens=%s dst=%s",
+            self._get_batch_phase(scheduler_output, is_first=True),
+            self.local_rank,
+            self.local_rank,
+            scheduler_output.total_num_scheduled_tokens,
+            self.local_rank + 1,
+        )
         self._pp_send_work = edge_cloud_isend_tensor_dict(
             _gathered,
             dst=self.local_rank + 1,
@@ -774,6 +793,15 @@ class SharedModelEdgeWorker(NPUWorker):
             # Receive the cloud's middle-layer result and run
             # the second forward (tail layers). The cloud peer
             # is at in-group rank ``self.local_rank + 1``.
+            logger.info(
+                "[EdgeCloud-RECV-SharedEdge] EDGE <-- CLOUD | %s | "
+                "local_rank=%s dp_rank=%s num_tokens=%s src=%s",
+                self._get_batch_phase(scheduler_output, is_first=False),
+                self.local_rank,
+                self.local_rank,
+                scheduler_output.total_num_scheduled_tokens,
+                self.local_rank + 1,
+            )
             tensor_dict, comm_handles, comm_postprocess = (
                 edge_cloud_broadcast_recv(
                     num_tokens=scheduler_output.total_num_scheduled_tokens,

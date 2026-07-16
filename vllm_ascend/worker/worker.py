@@ -21,6 +21,7 @@ import copy
 import gc
 import logging
 from types import NoneType
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -509,6 +510,29 @@ class NPUWorker(WorkerBase):
                 result[key] = tensor
         return result
 
+    @staticmethod
+    def _get_batch_phase(scheduler_output: "SchedulerOutput", is_first: Optional[bool] = None) -> str:
+        """Return "PREFILL_FIRST" / "PREFILL_LAST" / "DECODE_FIRST" / "DECODE_LAST"
+        depending on whether the batch is in prefill and direction.
+        
+        Direction:
+        - is_first=True  → Edge→Cloud (FIRST half of EC communication)
+        - is_first=False → Cloud→Edge (LAST half of EC communication)
+        """
+        phase = "DECODE"
+        new_req_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+        for req_id in scheduler_output.num_scheduled_tokens:
+            if req_id in new_req_ids:
+                phase = "PREFILL"
+                break
+            if scheduler_output.scheduled_cached_reqs.is_context_phase(req_id):
+                phase = "PREFILL"
+                break
+        if is_first is None:
+            return phase
+        suffix = "FIRST" if is_first else "LAST"
+        return f"{phase}_{suffix}"
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -524,6 +548,21 @@ class NPUWorker(WorkerBase):
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+        phase = self._get_batch_phase(scheduler_output)
+        device_role = "EDGE" if is_edge_device() else ("CLOUD" if is_cloud_device() else "MIDDLE")
+        logger.info(
+            "[SchedulerOutput] device_role=%s phase=%s | "
+            "total_num_scheduled_tokens=%s | "
+            "num_scheduled_tokens=%s | "
+            "new_reqs=%s cached_reqs=%s finished_req_ids=%s",
+            device_role,
+            phase,
+            scheduler_output.total_num_scheduled_tokens,
+            len(scheduler_output.num_scheduled_tokens),
+            len(scheduler_output.scheduled_new_reqs),
+            len(scheduler_output.scheduled_cached_reqs.req_ids),
+            len(scheduler_output.finished_req_ids),
+        )
         if forward_pass:
             if is_cloud_device():
                 # Pre-compute input preparation while edge runs segment_a.
@@ -553,6 +592,14 @@ class NPUWorker(WorkerBase):
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
                     sp_chunk=do_sp_chunk and merge_payload,
                     src=0,
+                )
+                logger.info(
+                    "[EdgeCloud-RECV] CLOUD <-- EDGE | %s | "
+                    "num_tokens=%s sp_chunk=%s merge=%s",
+                    self._get_batch_phase(scheduler_output, is_first=True),
+                    scheduler_output.total_num_scheduled_tokens,
+                    do_sp_chunk,
+                    merge_payload,
                 )
                 self.model_runner.cloud_prepare_early(scheduler_output)
 
@@ -608,12 +655,26 @@ class NPUWorker(WorkerBase):
                 # cudagraph / SP / DP padding, letting the cloud receiver
                 # allocate buffers from SchedulerOutput.total_num_scheduled_tokens
                 # without an inter-node metadata exchange.
+                logger.info(
+                    "[EdgeCloud-SEND] EDGE --> CLOUD | %s | "
+                    "num_tokens=%s",
+                    self._get_batch_phase(scheduler_output, is_first=True),
+                    scheduler_output.total_num_scheduled_tokens,
+                )
                 self._pp_send_work = edge_cloud_isend_tensor_dict(
                     _gathered,
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
                 )
             edge_sp = enable_sp()
             edge_merge = get_edge_cloud_tensor_meta().merge_payload
+            logger.info(
+                "[EdgeCloud-RECV] EDGE <-- CLOUD | %s | "
+                "num_tokens=%s edge_sp=%s edge_merge=%s",
+                self._get_batch_phase(scheduler_output, is_first=False),
+                scheduler_output.total_num_scheduled_tokens,
+                edge_sp,
+                edge_merge,
+            )
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
                 num_tokens=scheduler_output.total_num_scheduled_tokens,
                 sp_chunk=edge_sp and edge_merge,
@@ -657,6 +718,12 @@ class NPUWorker(WorkerBase):
                 # back to the unpadded length on the sender side so the edge
                 # receiver can keep allocating buffers from scheduler total
                 # alone (no metadata wire transfer needed).
+                logger.info(
+                    "[EdgeCloud-SEND] CLOUD --> EDGE | %s | "
+                    "num_tokens=%s dst=0",
+                    self._get_batch_phase(scheduler_output, is_first=False),
+                    scheduler_output.total_num_scheduled_tokens,
+                )
                 self._pp_send_work = edge_cloud_isend_tensor_dict(
                     _gathered,
                     dst=0,
