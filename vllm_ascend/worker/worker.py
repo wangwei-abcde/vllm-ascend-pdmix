@@ -512,22 +512,30 @@ class NPUWorker(WorkerBase):
 
     @staticmethod
     def _get_batch_phase(scheduler_output: "SchedulerOutput", is_first: Optional[bool] = None) -> str:
-        """Return "PREFILL_FIRST" / "PREFILL_LAST" / "DECODE_FIRST" / "DECODE_LAST"
-        depending on whether the batch is in prefill and direction.
-        
+        """Return batch phase type: "PREFILL", "DECODE", or "MIXED",
+        optionally suffixed with _FIRST/_LAST for EC communication direction.
+
         Direction:
-        - is_first=True  → Edge→Cloud (FIRST half of EC communication)
-        - is_first=False → Cloud→Edge (LAST half of EC communication)
+        - is_first=True  → Edge→Cloud (_FIRST)
+        - is_first=False → Cloud→Edge (_LAST)
+        - is_first=None  → no suffix (entry log)
         """
-        phase = "DECODE"
         new_req_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+        has_prefill = False
+        has_decode = False
         for req_id in scheduler_output.num_scheduled_tokens:
             if req_id in new_req_ids:
-                phase = "PREFILL"
-                break
-            if scheduler_output.scheduled_cached_reqs.is_context_phase(req_id):
-                phase = "PREFILL"
-                break
+                has_prefill = True
+            elif scheduler_output.scheduled_cached_reqs.is_context_phase(req_id):
+                has_prefill = True
+            else:
+                has_decode = True
+        if has_prefill and has_decode:
+            phase = "MIXED"
+        elif has_prefill:
+            phase = "PREFILL"
+        else:
+            phase = "DECODE"
         if is_first is None:
             return phase
         suffix = "FIRST" if is_first else "LAST"
