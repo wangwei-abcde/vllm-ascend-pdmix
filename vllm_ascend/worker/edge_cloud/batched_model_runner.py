@@ -1133,10 +1133,10 @@ class BatchedModelRunner(NPUModelRunner):
         # ``merged_sample_hidden_states = hidden_states[indices]``,
         # each row corresponds to the same physical token the
         # bundle's ``logits_indices`` originally pointed at.
-        if (merged_token_perm is not None
-                and merged_token_perm.numel() > 0
+        if (inv_merged_token_perm is not None
+                and inv_merged_token_perm.numel() > 0
                 and merged_logits_indices.numel() > 0):
-            merged_logits_indices = merged_token_perm.to(
+            merged_logits_indices = inv_merged_token_perm.to(
                 self.device)[merged_logits_indices]
         # FULL mode: copy ``intermediate_tensors`` to leader
         # runner's pre-allocated buffer so ``seg_e`` (which is
@@ -1386,21 +1386,11 @@ class BatchedModelRunner(NPUModelRunner):
             merged_perm = None
             merged_token_perm = None
             inv_merged_token_perm = None
-            # FULL mode buffer copy is still needed so the
-            # pre-allocated ``self.query_start_loc.gpu`` slot
-            # carries the merged cat-order qsl the head/tail
-            # forward will consume (the kernel reads through
-            # ``cm_merged.query_start_loc`` regardless of
-            # reorder).
+            # The pre-allocated ``self.query_start_loc.gpu``
+            # buffer is filled in the caller (FULL-mode copy
+            # happens there too).
             merged_query_start_loc = (
                 merged_query_start_loc_cpu.to(self.device))
-            if merged_cudagraph_mode == CUDAGraphMode.FULL:
-                self.query_start_loc.gpu[
-                    :merged_num_reqs_padded + 1].copy_(
-                        merged_query_start_loc)
-                merged_query_start_loc = (
-                    self.query_start_loc.gpu[
-                        :merged_num_reqs_padded + 1])
             return (
                 merged_query_start_loc_cpu,
                 merged_query_start_loc,
@@ -1485,16 +1475,17 @@ class BatchedModelRunner(NPUModelRunner):
         # ---- Apply ``merged_perm`` to per-req fields. After
         # this point, every per-req tensor is in decode-first
         # order.
+        # ``merged_seq_lens_cpu_upper`` is never ``None``
+        # (always present in the standard path). Permute it
+        # and re-establish aliases for ``merged__seq_lens_cpu``
+        # and ``merged_seq_lens_cpu`` (``merged__seq_lens_cpu``
+        # is always non-None, ``merged_seq_lens_cpu`` may be
+        # ``None`` in async spec decode — preserve that).
+        merged_seq_lens_cpu_upper = (
+            merged_seq_lens_cpu_upper[merged_perm].contiguous())
+        merged__seq_lens_cpu = merged_seq_lens_cpu_upper
         if merged_seq_lens_cpu is not None:
-            merged_seq_lens_cpu = (
-                merged_seq_lens_cpu[merged_perm].contiguous())
-        if merged_seq_lens_cpu_upper is not None:
-            merged_seq_lens_cpu_upper = (
-                merged_seq_lens_cpu_upper[merged_perm]
-                .contiguous())
-        if merged__seq_lens_cpu is not None:
-            merged__seq_lens_cpu = (
-                merged__seq_lens_cpu[merged_perm].contiguous())
+            merged_seq_lens_cpu = merged_seq_lens_cpu_upper
         if merged_num_computed_tokens_cpu is not None:
             merged_num_computed_tokens_cpu = (
                 merged_num_computed_tokens_cpu[merged_perm]
@@ -1528,15 +1519,11 @@ class BatchedModelRunner(NPUModelRunner):
             qsl_actual,
             merged_query_start_loc_cpu[merged_num_reqs + 1:],
         ])
+        # The pre-allocated ``self.query_start_loc.gpu``
+        # buffer is filled in the caller (FULL-mode copy
+        # happens there too).
         merged_query_start_loc = (
             merged_query_start_loc_cpu.to(self.device))
-        if merged_cudagraph_mode == CUDAGraphMode.FULL:
-            self.query_start_loc.gpu[
-                :merged_num_reqs_padded + 1].copy_(
-                    merged_query_start_loc)
-            merged_query_start_loc = (
-                self.query_start_loc.gpu[
-                    :merged_num_reqs_padded + 1])
 
         return (
             merged_query_start_loc_cpu,
@@ -1722,12 +1709,6 @@ class BatchedModelRunner(NPUModelRunner):
         merged_seq_lens = _cat_per_req_pad(
             lambda cm: cm.seq_lens, 0, any_cm.seq_lens.dtype,
             self.device)
-        merged_seq_lens_cpu = _cat_per_req_pad(
-            lambda cm: cm.seq_lens_cpu, 0,
-            any_cm.seq_lens_cpu.dtype
-            if any_cm.seq_lens_cpu is not None else torch.int32,
-            "cpu") if any(cm.seq_lens_cpu is not None
-                          for cm in cms_unpadded) else None
         merged_seq_lens_cpu_upper = _cat_per_req_pad(
             lambda cm: cm.seq_lens_cpu_upper_bound, 0,
             any_cm.seq_lens_cpu_upper_bound.dtype
@@ -1735,12 +1716,19 @@ class BatchedModelRunner(NPUModelRunner):
             else torch.int32,
             "cpu") if any(cm.seq_lens_cpu_upper_bound is not None
                           for cm in cms_unpadded) else None
-        merged__seq_lens_cpu = _cat_per_req_pad(
-            lambda cm: cm._seq_lens_cpu, 0,
-            any_cm._seq_lens_cpu.dtype
-            if any_cm._seq_lens_cpu is not None else torch.int32,
-            "cpu") if any(cm._seq_lens_cpu is not None
-                          for cm in cms_unpadded) else None
+        # Per ``model_runner_v1.py:4393-4396`` invariant:
+        # ``_seq_lens_cpu`` is always
+        # ``self.optimistic_seq_lens_cpu[:num_reqs_padded]`` (same
+        # buffer as ``seq_lens_cpu_upper_bound``); ``seq_lens_cpu``
+        # is either that same buffer or ``None`` (async spec
+        # decode). Reuse the upper buffer as an alias here so the
+        # three fields share one cat output and one FULL-mode
+        # ``copy_``.
+        merged__seq_lens_cpu = merged_seq_lens_cpu_upper
+        if any(cm.seq_lens_cpu is not None for cm in cms_unpadded):
+            merged_seq_lens_cpu = merged_seq_lens_cpu_upper
+        else:
+            merged_seq_lens_cpu = None
         merged_num_computed_tokens_cpu = _cat_per_req_pad(
             lambda cm: cm.num_computed_tokens_cpu, 0,
             any_cm.num_computed_tokens_cpu.dtype
@@ -1809,6 +1797,45 @@ class BatchedModelRunner(NPUModelRunner):
                 merged_num_computed_tokens_cpu),
             merged_is_prefilling=merged_is_prefilling,
         )
+        # FULL mode: copy the permuted
+        # ``merged_seq_lens_cpu_upper`` to the leader runner's
+        # pre-allocated ``self.optimistic_seq_lens_cpu`` buffer
+        # so the attention kernel reads from a stable CPU
+        # pointer across cudagraph captures. Re-establish the
+        # aliases for ``merged_seq_lens_cpu`` /
+        # ``merged__seq_lens_cpu`` so they share the same
+        # stable address (matching the standard path's
+        # invariant at ``model_runner_v1.py:4393-4396``).
+        if merged_cudagraph_mode == CUDAGraphMode.FULL:
+            self.optimistic_seq_lens_cpu[
+                :merged_num_reqs_padded].copy_(
+                    merged_seq_lens_cpu_upper)
+            seq_lens_cpu_buf = (
+                self.optimistic_seq_lens_cpu[
+                    :merged_num_reqs_padded])
+            merged_seq_lens_cpu_upper = seq_lens_cpu_buf
+            merged__seq_lens_cpu = seq_lens_cpu_buf
+            if merged_seq_lens_cpu is not None:
+                merged_seq_lens_cpu = seq_lens_cpu_buf
+            # NPU ``merged_seq_lens``: copy to leader runner's
+            # ``self.seq_lens`` buffer so the attention kernel
+            # reads from a stable device pointer across
+            # cudagraph captures.
+            if merged_seq_lens is not None:
+                self.seq_lens[:merged_num_reqs_padded].copy_(
+                    merged_seq_lens)
+                merged_seq_lens = (
+                    self.seq_lens[:merged_num_reqs_padded])
+            # ``merged_query_start_loc``: copy to leader runner's
+            # pre-allocated ``self.query_start_loc.gpu`` buffer
+            # so the kernel reads from a stable device pointer
+            # across cudagraph captures.
+            self.query_start_loc.gpu[
+                :merged_num_reqs_padded + 1].copy_(
+                    merged_query_start_loc)
+            merged_query_start_loc = (
+                self.query_start_loc.gpu[
+                    :merged_num_reqs_padded + 1])
 
         # ``positions`` / ``positions_cpu`` (DSA): ``unpadded``
         # keeps them full-length; slice to
@@ -2262,6 +2289,23 @@ class BatchedModelRunner(NPUModelRunner):
                  for b, n in zip(bundles, n_actuals)])
         else:
             merged_inputs_embeds_ctx = None
+        # ``merged_positions`` is built from per-dp_rank
+        # ``bundle.positions`` (the same tensor
+        # ``_preprocess`` returned; matches what
+        # ``_model_forward(positions=...)`` reads). Do NOT
+        # source from ``cm.positions`` (AscendCommonAttentionMetadata
+        # may carry a different positions tensor — e.g.
+        # ``mrope_positions`` / ``xdrope_positions`` path) since
+        # ``forward`` consumes the buffer we write here, not the
+        # metadata field.
+        if all(b.positions is not None for b in bundles):
+            cat_dim = bundles[0].positions.dim() - 1
+            merged_positions_ctx = torch.cat(
+                [b.positions[..., :n]
+                 for b, n in zip(bundles, n_actuals)],
+                dim=cat_dim)
+        else:
+            merged_positions_ctx = None
         # Decode-first reorder: ``input_ids`` / ``inputs_embeds``
         # are per-token. Apply ``merged_token_perm`` over the
         # actual range so the per-token order matches the
@@ -2288,6 +2332,16 @@ class BatchedModelRunner(NPUModelRunner):
                 merged_inputs_embeds_ctx_actual,
                 merged_inputs_embeds_ctx[merged_num_actual_tokens:],
             ])
+        if (merged_positions_ctx is not None
+                and merged_num_actual_tokens > 0
+                and need_reorder):
+            merged_positions_ctx_actual = (
+                merged_positions_ctx[..., :merged_num_actual_tokens][
+                    ..., merged_token_perm])
+            merged_positions_ctx = torch.cat([
+                merged_positions_ctx_actual,
+                merged_positions_ctx[..., merged_num_actual_tokens:],
+            ], dim=-1)
         # FULL mode: copy ``input_ids`` / ``inputs_embeds`` to
         # leader runner's pre-allocated buffers so
         # ``_model_forward(input_ids=..., inputs_embeds=...)``
@@ -2318,6 +2372,34 @@ class BatchedModelRunner(NPUModelRunner):
                     merged_inputs_embeds_ctx)
                 merged_inputs_embeds_ctx = (
                     self.inputs_embeds.gpu[:merged_num_tokens_padded])
+            if merged_positions_ctx is not None:
+                # Match the buffer that ``_preprocess`` /
+                # ``_build_attention_metadata`` uses to source
+                # positions — plain / mrope / xdrope — so that
+                # ``_model_forward(positions=...)`` reads back the
+                # same buffer it would in the standard path.
+                if self.uses_mrope:
+                    pos_buf = self.mrope_positions.gpu[
+                        :, :merged_num_tokens_padded]
+                    pos_buf[:, merged_num_actual_tokens:
+                            merged_num_tokens_padded].fill_(0)
+                    pos_buf[:, :merged_num_actual_tokens].copy_(
+                        merged_positions_ctx)
+                elif self.uses_xdrope_dim > 0:
+                    pos_buf = self.xdrope_positions.gpu[
+                        :, :merged_num_tokens_padded]
+                    pos_buf[:, merged_num_actual_tokens:
+                            merged_num_tokens_padded].fill_(0)
+                    pos_buf[:, :merged_num_actual_tokens].copy_(
+                        merged_positions_ctx)
+                else:
+                    pos_buf = self.positions[
+                        :merged_num_tokens_padded]
+                    pos_buf[merged_num_actual_tokens:
+                            merged_num_tokens_padded].fill_(0)
+                    pos_buf[:merged_num_actual_tokens].copy_(
+                        merged_positions_ctx)
+                merged_positions_ctx = pos_buf
 
         ctx = _MergedAttnContext(
             merged_attn_metadata=merged_attn_metadata,
@@ -2325,7 +2407,7 @@ class BatchedModelRunner(NPUModelRunner):
             merged_cudagraph_mode=merged_cudagraph_mode,
             num_tokens_padded_merged=merged_num_tokens_padded,
             merged_input_ids=merged_input_ids_ctx,
-            merged_positions=merged_positions,
+            merged_positions=merged_positions_ctx,
             merged_inputs_embeds=merged_inputs_embeds_ctx,
             merged_token_perm=merged_token_perm,
             inv_merged_token_perm=inv_merged_token_perm,
