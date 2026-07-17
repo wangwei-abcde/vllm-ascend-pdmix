@@ -236,19 +236,27 @@ def _dp_exchange_status(self, my_status: str, phase: str = "") -> str:
     dp_store.set(f"done_r{my}", "1")
     dp_store.wait([f"done_r{other}"])
 
-    # (5) Working DP: write phase FIRST, then clean everything + signal
+    # (5) Working DP: write phase FIRST, then delete all keys + signal.
+    #     delete_key ensures wait() will block until the next write.
     if my_status == "working":
         vllm_logger.info("[DPSTORE] dp%d clean+signal phase=%s", my, phase)
         if phase:
             dp_store.set("batch_phase", phase)
-        for k in ("status_r0", "status_r1", "done_r0", "done_r1"):
-            dp_store.set(k, "")
+        for k in ("status_r0", "status_r1", "done_r0", "done_r1",
+                  "batch_phase", "cleaned"):
+            try:
+                dp_store.delete_key(k)
+            except Exception:
+                pass
         dp_store.set("cleaned", "1")
 
     # (6) Everyone waits for cleanup; idle DP resets confirmation
     dp_store.wait(["cleaned"])
     if my_status != "working":
-        dp_store.set("cleaned", "")
+        try:
+            dp_store.delete_key("cleaned")
+        except Exception:
+            pass
 
     vllm_logger.info("[DPSTORE] dp%d exchange done, other=%s", my, other_status)
     return other_status
