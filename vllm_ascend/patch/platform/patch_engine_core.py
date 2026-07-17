@@ -218,10 +218,15 @@ def _sync_phase_allgather(self, phase: int | None) -> int | None:
     dp_rank = int(getattr(self, "dp_rank", 0))
     my_obj = {"has_req": phase is not None and phase != 0, "phase": phase or 0}
     gathered = [None, None]
+
+    vllm_logger.info(
+        "[DPGATHER] dp%d enter all_gather phase=%s",
+        dp_rank, phase,
+    )
     dist.all_gather_object(gathered, my_obj, group=dp_group)
 
     vllm_logger.info(
-        "[DPGATHER] dp%d my_phase=%s gathered=%s",
+        "[DPGATHER] dp%d exit  all_gather my_phase=%s gathered=%s",
         dp_rank, phase, gathered,
     )
 
@@ -500,7 +505,17 @@ def _patched_step_with_batch_queue(self):
 
         # [ascend insert] Publish active batch phase to dp_store so idle
         # DPs know whether to send a FIRST or LAST dummy.
+        vllm_logger.info(
+            "[EDGE-TRACE] dp%s schedule bt=%s",
+            getattr(self, "dp_rank", "?"),
+            scheduler_output.batch_type.value if scheduler_output else "none",
+        )
         self._publish_batch_phase(scheduler_output)
+        vllm_logger.info(
+            "[EDGE-TRACE] dp%s phase_pub_done bt=%s",
+            getattr(self, "dp_rank", "?"),
+            scheduler_output.batch_type.value if scheduler_output else "none",
+        )
 
         # [ascend insert] Assign head-token for edge-cloud head-segment
         # batches so the tail-segment can be matched to the suspended
@@ -588,6 +603,11 @@ def _patched_step_with_batch_queue(self):
     # eventually becomes batch_queue[-1] before pop().
     self._publish_pre_out_when_ready()
     future, scheduler_output, exec_model_fut = batch_queue.pop()
+    vllm_logger.info(
+        "[EDGE-TRACE] dp%s pop_bt=%s",
+        getattr(self, "dp_rank", "?"),
+        scheduler_output.batch_type.value,
+    )
     # [ascend insert] Clean up PRE_OUT tracking for completed batch.
     self._clear_published_pre_out_token(scheduler_output)
     with (
@@ -595,6 +615,11 @@ def _patched_step_with_batch_queue(self):
         self.log_iteration_details(scheduler_output),
     ):
         model_output = future.result()
+        vllm_logger.info(
+            "[EDGE-TRACE] dp%s model_done bt=%s",
+            getattr(self, "dp_rank", "?"),
+            scheduler_output.batch_type.value,
+        )
         if model_output is None:
             exec_model_fut.result()
             raise RuntimeError("unexpected error")
@@ -751,6 +776,10 @@ def _patched_execute_dummy_batch(self):
     """
     ch = getattr(self, "_pp_pd_channel", None)
     if ch is not None:
+        vllm_logger.info(
+            "[DUMMY-TRACE] dp%s enter dummy_loop",
+            getattr(self, "dp_rank", "?"),
+        )
         from vllm.v1.core.sched.output import (
             BatchType as _BatchType,
             HiddenChannelType as _HiddenChannelType,
