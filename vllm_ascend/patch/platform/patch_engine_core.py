@@ -200,9 +200,12 @@ def _drain_pd_channel_inbox(self) -> None:
             )
 
 
-def _dp_exchange_status(self, my_status: str) -> str:
+def _dp_exchange_status(self, my_status: str, phase: str = "") -> str:
     """Symmetric 2-DP status exchange. Both-working skips the full
     protocol entirely; working+idle uses done/cleaned handshake.
+
+    When my_status=="working" and phase is set, batch_phase is written
+    BEFORE cleaned so the idle DP always reads a fresh value.
 
     Keys: status_r0, status_r1, done_r0, done_r1, batch_phase, cleaned
     """
@@ -215,24 +218,30 @@ def _dp_exchange_status(self, my_status: str) -> str:
 
     # (1) Announce my status; (2) Read other's status
     dp_store.set(f"status_r{my}", my_status)
+    vllm_logger.info("[DPSTORE] dp%d write status=%s", my, my_status)
     dp_store.wait([f"status_r{other}"])
     other_status = dp_store.get(f"status_r{other}")
     if isinstance(other_status, bytes):
         other_status = other_status.decode()
+    vllm_logger.info("[DPSTORE] dp%d read dp%d status=%s", my, other, other_status)
 
-    # Same status (both working or both idle): no phase sync needed,
-    # just clean our own key and go
+    # Same status (both working or both idle): no phase sync needed.
+    # Do NOT clean keys here — the next working+idle exchange will do it.
     if my_status == other_status:
-        dp_store.set(f"status_r{my}", "")
+        if my_status == "working":
+            vllm_logger.info("[DPSTORE] dp%d both working, skip", my)
         return other_status
 
     # (3) Ack I've read; (4) Wait for other's ack
     dp_store.set(f"done_r{my}", "1")
     dp_store.wait([f"done_r{other}"])
 
-    # (5) Working DP cleans ALL keys
+    # (5) Working DP: write phase FIRST, then clean everything + signal
     if my_status == "working":
-        for k in ("status_r0", "status_r1", "done_r0", "done_r1", "batch_phase"):
+        vllm_logger.info("[DPSTORE] dp%d clean+signal phase=%s", my, phase)
+        if phase:
+            dp_store.set("batch_phase", phase)
+        for k in ("status_r0", "status_r1", "done_r0", "done_r1"):
             dp_store.set(k, "")
         dp_store.set("cleaned", "1")
 
@@ -241,6 +250,7 @@ def _dp_exchange_status(self, my_status: str) -> str:
     if my_status != "working":
         dp_store.set("cleaned", "")
 
+    vllm_logger.info("[DPSTORE] dp%d exchange done, other=%s", my, other_status)
     return other_status
 
 
@@ -258,9 +268,10 @@ def _publish_batch_phase(self, scheduler_output: SchedulerOutput) -> None:
     phase = 1 if bt in (BatchType.DECODE_FIRST, BatchType.PREFILL_FIRST) else (
         2 if bt in (BatchType.DECODE_LAST, BatchType.PREFILL_LAST) else 0)
 
-    other_status = self._dp_exchange_status("working")
-    if other_status == "idle":
-        dp_store.set("batch_phase", str(phase))
+    vllm_logger.info("[DPSTORE] dp%s pub phase=%d bt=%s",
+                     getattr(self, "dp_rank", "?"), phase,
+                     bt.value if bt else "none")
+    self._dp_exchange_status("working", str(phase))
 
 
 def _maybe_publish_pre_out(
@@ -775,12 +786,19 @@ def _patched_execute_dummy_batch(self):
         if dp_store is not None:
             other_status = self._dp_exchange_status("idle")
             if other_status == "idle":
+                vllm_logger.info("[DPSTORE] dp%s dummy both idle, skip",
+                                 getattr(self, "dp_rank", "?"))
                 return
 
-            # Peer is working — read its phase (working DP cleans this
-            # key in _dp_exchange_status before writing the new value).
+            # Peer is working — read its phase (working DP writes it
+            # before cleaned in _dp_exchange_status).
             dp_store.wait(["batch_phase"])
-            dummy_phase = int(dp_store.get("batch_phase"))
+            val = dp_store.get("batch_phase")
+            if isinstance(val, bytes):
+                val = val.decode()
+            dummy_phase = int(val) if val else 1  # defensive: fallback FIRST
+            vllm_logger.info("[DPSTORE] dp%s dummy read phase=%d raw=%r",
+                             getattr(self, "dp_rank", "?"), dummy_phase, val)
         else:
             dummy_phase = 1  # default: FIRST (no dp_store fallback)
 
