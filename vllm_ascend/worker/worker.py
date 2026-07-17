@@ -1161,8 +1161,9 @@ class NPUWorker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
-    def execute_dummy_batch(self) -> None:
-        self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True)
+    def execute_dummy_batch(self, phase: int | None = None) -> None:
+        self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=True,
+                                     phase=phase)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

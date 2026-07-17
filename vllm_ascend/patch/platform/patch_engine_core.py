@@ -769,7 +769,13 @@ def _patched_execute_dummy_batch(self):
             dummy_so.hidden_channel = _HiddenChannelType.DECODE
             ch.publish(dummy_so)
 
-    self.model_executor.execute_dummy_batch()
+        self.model_executor.collective_rpc(
+            "execute_dummy_batch",
+            args=(dummy_phase,),
+            unique_reply_rank=self.model_executor.output_rank,
+        )
+    else:
+        self.model_executor.execute_dummy_batch()
 
 
 # =======================================================================#

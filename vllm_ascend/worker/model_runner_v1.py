@@ -5281,6 +5281,7 @@ class NPUModelRunner(GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
+        phase: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -5478,8 +5479,28 @@ class NPUModelRunner(GPUModelRunner):
             # 替代标准 PP（Pipeline Parallelism）的 is_first_rank 判断（pp_size=1 时所有 rank 都是 first）。
             if self._edge_cloud_enabled:
                 if self.edge_cloud_cfg.role == "edge":
-                    # Edge 端：不需要中间张量（第一阶段）
-                    intermediate_tensors = None
+                    if phase == 2:
+                        # LAST: 执行 seg_e（尾段），需要 dummy
+                        # IntermediateTensors 供 seg_e 走 all-to-all 配对。
+                        intermediate_tokens = num_tokens_padded
+                        if enable_sp() and (self.edge_cloud_cfg.mode != "embedding_only"
+                            or not self.supports_mm_inputs):
+                            tp_size = get_tensor_model_parallel_world_size()
+                            intermediate_tokens = (num_tokens_padded + tp_size - 1) // tp_size
+                        if self.intermediate_tensors is None:
+                            max_actual_tokens = self.max_num_tokens
+                            if enable_sp() and (self.edge_cloud_cfg.mode != "embedding_only"
+                                or not self.supports_mm_inputs):
+                                max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
+                            self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                                batch_size=max_actual_tokens, dtype=self.dtype, device=self.device
+                            )
+                        intermediate_tensors = IntermediateTensors(
+                            {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
+                        )
+                    else:
+                        # phase=1 或 None：seg_a（首段），不需要中间张量
+                        intermediate_tensors = None
                 else:
                     # Cloud 端：需要中间张量
                     intermediate_tokens = num_tokens_padded
@@ -5592,7 +5613,9 @@ class NPUModelRunner(GPUModelRunner):
                 self._dsa_positions_cpu_buf.fill_(0)
 
             # ========== Edge 设备特殊处理：Edge 首阶段需要执行最后一层 ==========
-            if is_edge_device():
+            # phase 非 None 时（dummy FIRST/LAST），已在上面根据 phase 控制
+            # 了 intermediate_tensors 路由，此处跳过默认的"首→尾"追加。
+            if phase is None and is_edge_device():
                 # 断言：边设备输出必须是 IntermediateTensors 类型
                 assert isinstance(outputs, IntermediateTensors)
 
