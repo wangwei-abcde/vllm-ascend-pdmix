@@ -769,7 +769,14 @@ def _patched_execute_dummy_batch(self):
             dummy_so.hidden_channel = _HiddenChannelType.DECODE
             ch.publish(dummy_so)
 
-    self.model_executor.execute_dummy_batch()
+    # Run the dummy batch on edge workers, passing the phase so the
+    # worker routes to the correct segment (seg_a for FIRST, seg_e for
+    # LAST) to match the cross-DP all-to-all sequence.
+    self.model_executor.collective_rpc(
+        "execute_dummy_batch",
+        args=(dummy_phase,),
+        unique_reply_rank=self.model_executor.output_rank,
+    )
 
 
 # =======================================================================#
