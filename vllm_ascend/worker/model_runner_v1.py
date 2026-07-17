@@ -3874,14 +3874,13 @@ class NPUModelRunner(GPUModelRunner):
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        phase: int | None = None,
         **model_kwargs: dict[str, Any],
     ):
         """模型前向入口。标准路径与边云路径完全分离，职责单一。"""
         if self._edge_cloud_enabled:
             return self._edge_cloud_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors,
-                inputs_embeds, phase=phase, **model_kwargs,
+                inputs_embeds, **model_kwargs,
             )
 
         # ==================== 标准非边云路径（原逻辑完全保留，不做任何修改） ====================
@@ -4175,7 +4174,6 @@ class NPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         layer_slice_info: Any = None,
-        phase: int | None = None,
         **model_kwargs: dict[str, Any],
     ):
         """边云场景的分段前向执行。
@@ -4249,8 +4247,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.edge_cloud_cfg.role == "edge":
             return self._edge_cloud_forward_edge(
                 num_tokens_padded, input_ids, positions, intermediate_tensors,
-                inputs_embeds, use_graph, forward_context,
-                phase=phase, **model_kwargs,
+                inputs_embeds, use_graph, forward_context, **model_kwargs,
             )
         else:
             return self._edge_cloud_forward_cloud(
@@ -4346,27 +4343,16 @@ class NPUModelRunner(GPUModelRunner):
         inputs_embeds: torch.Tensor | None,
         use_graph: bool,
         forward_context,
-        phase: int | None = None,
         **model_kwargs: dict[str, Any],
     ):
-        """Edge 侧分段执行：segment_a（首段）或 segment_e（尾段）。
-
-        - phase=None（默认）：正常路径，根据 intermediate_tensors 路由。
-        - phase=1：dummy FIRST，强制执行 seg_a（head）。
-        - phase=2：dummy LAST，强制执行 seg_e（tail）。
-        """
+        """Edge 侧分段执行：segment_a（首段）或 segment_e（尾段）。"""
         seg_a = self.segment_a_wrapper if use_graph else self.segment_a
         seg_e = self.segment_e_wrapper if use_graph else self.segment_e
         #seg_e = self.segment_e
         seg_a_graph = isinstance(seg_a, ACLGraphWrapper)
         seg_e_graph = isinstance(seg_e, ACLGraphWrapper)
 
-        # 路由决策：phase 显式指定时覆盖正常逻辑
-        _run_seg_e = intermediate_tensors is not None
-        if phase is not None:
-            _run_seg_e = (phase == 2)
-
-        if not _run_seg_e:
+        if intermediate_tensors is None:
             # Step 1：执行 Segment A（embedding + 首 head_k 层）
             # 此时 input_ids 有效，输出 IntermediateTensors 供跨节点传输
             from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -5295,7 +5281,6 @@ class NPUModelRunner(GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
-        phase: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -5574,8 +5559,7 @@ class NPUModelRunner(GPUModelRunner):
                 input_ids=input_ids,
             ):
                 outputs = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds,
-                    phase=phase,
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
                 )
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
