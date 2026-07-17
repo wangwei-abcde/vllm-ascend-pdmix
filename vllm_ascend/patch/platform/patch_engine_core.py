@@ -211,7 +211,7 @@ def _publish_batch_phase(self, scheduler_output: SchedulerOutput) -> None:
     dp_store = getattr(self, "dp_store", None)
     dp_rank = getattr(self, "dp_rank", "?")
     bt = scheduler_output.batch_type if scheduler_output else None
-    logger.info(
+    vllm_logger.info(
         "[DPSTORE PUB] dp=%s wave=%d batch_type=%s dp_store=%s "
         "has_requests=%s",
         dp_rank, getattr(self, "current_wave", "?"),
@@ -236,7 +236,7 @@ def _publish_batch_phase(self, scheduler_output: SchedulerOutput) -> None:
     # leading to dp_store.wait() blocking forever on a key nobody writes.
     key = f"batch_phase_w{self.current_wave}"
     dp_rank = getattr(self, "dp_rank", "?")
-    logger.info(
+    vllm_logger.info(
         "[DPSTORE PUB] dp=%s wave=%d batch_type=%s phase=%d key=%s",
         dp_rank, self.current_wave,
         bt.value if bt is not None else "<none>",
@@ -770,13 +770,13 @@ def _patched_execute_dummy_batch(self):
             if dp_store is not None:
                 key = f"batch_phase_w{self.current_wave}"
                 dp_rank = getattr(self, "dp_rank", "?")
-                logger.info(
+                vllm_logger.info(
                     "[DPSTORE WAIT] dp=%s wave=%d key=%s waiting...",
                     dp_rank, self.current_wave, key,
                 )
                 dp_store.wait([key])
                 dummy_phase = int(dp_store.get(key))
-                logger.info(
+                vllm_logger.info(
                     "[DPSTORE READ] dp=%s wave=%d key=%s phase=%d",
                     dp_rank, self.current_wave, key, dummy_phase,
                 )
