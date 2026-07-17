@@ -217,10 +217,15 @@ def _publish_batch_phase(self, scheduler_output: SchedulerOutput) -> None:
         phase = 1
     elif bt in (BatchType.DECODE_LAST, BatchType.PREFILL_LAST):
         phase = 2
-    # Include step_counter so each iteration has a unique key,
-    # allowing the idle DP to wait() on the key without risk of
-    # reading stale data from a previous iteration in the same wave.
-    key = f"batch_phase_w{self.current_wave}_s{self.step_counter}"
+    # Each wave has its own key.  The active DP overwrites the key on
+    # every schedule() call so the idle DP always reads the latest phase.
+    # NOTE: do NOT include step_counter in the key — step_counter is
+    # incremented in _has_global_unfinished_reqs which is called at the
+    # END of each run_busy_loop iteration, while _publish_batch_phase is
+    # only called in _patched_step() when has_requests() is True.
+    # During "waiting for cloud" iterations the two counters diverge,
+    # leading to dp_store.wait() blocking forever on a key nobody writes.
+    key = f"batch_phase_w{self.current_wave}"
     dp_store.set(key, str(phase))
 
 
@@ -740,15 +745,14 @@ def _patched_execute_dummy_batch(self):
         # (tail, edge-only) dummy so the cross-DP all-to-all pairs
         # correctly with the real DP's current segment.
         #
-        # The key includes step_counter so each iteration is unique.
-        # dp_store.wait([key]) blocks until the active DP publishes
-        # the phase for this iteration, eliminating the race where
-        # the idle DP reads before the active DP writes.
+        # Uses a per-wave key (no step_counter — see _publish_batch_phase
+        # for rationale).  dp_store.wait([key]) blocks until the active DP
+        # publishes a phase for the current wave.
         dummy_phase = 1  # default: FIRST
         try:
             dp_store = getattr(self, "dp_store", None)
             if dp_store is not None:
-                key = f"batch_phase_w{self.current_wave}_s{self.step_counter}"
+                key = f"batch_phase_w{self.current_wave}"
                 dp_store.wait([key])
                 dummy_phase = int(dp_store.get(key))
         except Exception:
