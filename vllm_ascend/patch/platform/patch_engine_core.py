@@ -200,6 +200,30 @@ def _drain_pd_channel_inbox(self) -> None:
             )
 
 
+def _publish_batch_phase(self, scheduler_output: SchedulerOutput) -> None:
+    """Write the current batch type phase (FIRST / LAST) to dp_store so
+    idle DPs can read it and decide which dummy segment to run, keeping
+    the cross-DP all-to-all pairing correct.
+
+    Phase encoding: 0 = idle/empty, 1 = FIRST (head), 2 = LAST (tail).
+    Each wave gets its own key to avoid stale data leaking across waves.
+    """
+    dp_store = getattr(self, "dp_store", None)
+    if dp_store is None:
+        return
+    bt = scheduler_output.batch_type if scheduler_output else None
+    phase = 0
+    if bt in (BatchType.DECODE_FIRST, BatchType.PREFILL_FIRST):
+        phase = 1
+    elif bt in (BatchType.DECODE_LAST, BatchType.PREFILL_LAST):
+        phase = 2
+    # Include step_counter so each iteration has a unique key,
+    # allowing the idle DP to wait() on the key without risk of
+    # reading stale data from a previous iteration in the same wave.
+    key = f"batch_phase_w{self.current_wave}_s{self.step_counter}"
+    dp_store.set(key, str(phase))
+
+
 def _maybe_publish_pre_out(
     self, scheduler_output: SchedulerOutput
 ) -> None:
@@ -389,6 +413,10 @@ def _patched_step(self):
 
     scheduler_output = self.scheduler.schedule()
 
+    # [ascend insert] Publish active batch phase to dp_store so idle
+    # DPs know whether to send a FIRST or LAST dummy.
+    self._publish_batch_phase(scheduler_output)
+
     # [ascend insert] Forward head-segment batches on the PRE_OUT
     # (edge → cloud) channel.
     self._maybe_publish_pre_out(scheduler_output)
@@ -442,6 +470,10 @@ def _patched_step_with_batch_queue(self):
         self._drain_pd_channel_inbox()
 
         scheduler_output = self.scheduler.schedule()
+
+        # [ascend insert] Publish active batch phase to dp_store so idle
+        # DPs know whether to send a FIRST or LAST dummy.
+        self._publish_batch_phase(scheduler_output)
 
         # [ascend insert] Assign head-token for edge-cloud head-segment
         # batches so the tail-segment can be matched to the suspended
@@ -676,6 +708,71 @@ def _patched_process_input_queue(self):
 
 
 # =======================================================================#
+# EngineCore.execute_dummy_batch - 方案③: route dummy per-DP via zmq.       #
+# =======================================================================#
+def _patched_execute_dummy_batch(self):
+    """PD-separation edge: mirror execute_model's per-DP zmq path so the
+    idle DP's dummy does NOT reach the cloud via the cross-node
+    rpc_broadcast_mq broadcast (which would deliver it to the DP running
+    real work and break cross-DP all_reduce pairing -> deadlock).
+
+    Cloud workers skip the cross-node ``execute_dummy_batch`` (see
+    multiproc_executor.worker_busy_loop), so ``executor.execute_dummy_batch``
+    below only runs the dummy on *this* DP's edge workers. We additionally
+    publish a dummy SchedulerOutput via zmq so the paired cloud DP runs a
+    dummy-middle (see worker._execute_model_cloud `is_pd_dummy` branch) and
+    keeps the cloud-side cross-DP all_reduce paired.
+
+    When PD-separation is off (no ``_pp_pd_channel``) this is identical to
+    upstream: just ``executor.execute_dummy_batch()``.
+    """
+    ch = getattr(self, "_pp_pd_channel", None)
+    if ch is not None:
+        from vllm.v1.core.sched.output import (
+            BatchType as _BatchType,
+            HiddenChannelType as _HiddenChannelType,
+            SchedulerOutput as _SchedulerOutput,
+        )
+        from uuid import uuid4
+
+        # Read the active DP's batch phase from dp_store to decide
+        # whether to send a FIRST (head, via zmq → cloud) or LAST
+        # (tail, edge-only) dummy so the cross-DP all-to-all pairs
+        # correctly with the real DP's current segment.
+        #
+        # The key includes step_counter so each iteration is unique.
+        # dp_store.wait([key]) blocks until the active DP publishes
+        # the phase for this iteration, eliminating the race where
+        # the idle DP reads before the active DP writes.
+        dummy_phase = 1  # default: FIRST
+        try:
+            dp_store = getattr(self, "dp_store", None)
+            if dp_store is not None:
+                key = f"batch_phase_w{self.current_wave}_s{self.step_counter}"
+                dp_store.wait([key])
+                dummy_phase = int(dp_store.get(key))
+        except Exception:
+            pass
+
+        dummy_so = _SchedulerOutput.make_empty()
+        dummy_so.head_token = uuid4().hex
+        setattr(dummy_so, "is_pd_dummy", True)
+
+        if dummy_phase == 2:
+            # Active DP is in LAST (tail segment, edge-only).
+            # Do NOT publish to cloud; tail runs entirely on edge.
+            dummy_so.batch_type = _BatchType.DECODE_LAST
+        else:
+            # Active DP is in FIRST (head segment).
+            # Publish to cloud so the paired cloud DP runs a dummy-middle.
+            dummy_so.batch_type = _BatchType.DECODE_FIRST
+            dummy_so.hidden_channel = _HiddenChannelType.DECODE
+            ch.publish(dummy_so)
+
+    self.model_executor.execute_dummy_batch()
+
+
+# =======================================================================#
 # Install                                                                  #
 # =======================================================================#
 def install() -> None:
@@ -684,6 +781,7 @@ def install() -> None:
 
     EngineCore.__init__ = _patched_engine_core_init
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
+    EngineCore._publish_batch_phase = _publish_batch_phase
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
     EngineCore._publish_pre_out_when_ready = _publish_pre_out_when_ready
     EngineCore._clear_published_pre_out_token = _clear_published_pre_out_token
@@ -695,6 +793,7 @@ def install() -> None:
     EngineCore._pop_deferred_empty_batch = _pop_deferred_empty_batch
     EngineCore.step = _patched_step
     EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
+    EngineCore.execute_dummy_batch = _patched_execute_dummy_batch
     EngineCore.shutdown = _patched_engine_core_shutdown
 
     EngineCoreProc.run_engine_core = staticmethod(_patched_run_engine_core)
