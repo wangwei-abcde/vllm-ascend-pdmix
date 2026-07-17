@@ -250,9 +250,24 @@ def _publish_batch_phase(self, scheduler_output: SchedulerOutput) -> None:
     phase = 1 if bt in (BatchType.DECODE_FIRST, BatchType.PREFILL_FIRST) else (
         2 if bt in (BatchType.DECODE_LAST, BatchType.PREFILL_LAST) else 0)
 
-    vllm_logger.info("[DPGATHER] dp%s pub phase=%d bt=%s",
-                     getattr(self, "dp_rank", "?"), phase,
-                     bt.value if bt else "none")
+    dp_rank = getattr(self, "dp_rank", "?")
+    _has_req = self.scheduler.has_requests()
+    _has_unf = self.scheduler.has_unfinished_requests()
+    _eng_run = getattr(self, "engines_running", None)
+
+    vllm_logger.info(
+        "[DPGATHER] dp%s pub phase=%d bt=%s "
+        "has_req=%s has_unfin=%s eng_run=%s",
+        dp_rank, phase,
+        bt.value if bt else "none",
+        _has_req, _has_unf, _eng_run,
+    )
+    if phase == 0:
+        vllm_logger.warning(
+            "[DPGATHER] dp%s pub *** phase=0 (EMPTY/unknown), bt=%s "
+            "*** MAY CAUSE DP OUT-OF-SYNC ***",
+            dp_rank, bt.value if bt else "none",
+        )
     self._sync_phase_allgather(phase)
 
 
@@ -436,6 +451,11 @@ def _patched_step(self):
     """
     # Check for any requests remaining in the scheduler - unfinished,
     # or finished and not yet removed from the batch.
+    _has_req = self.scheduler.has_requests()
+    vllm_logger.info(
+        "[EDGE-TRACE] dp%s step(NON_BATCH) entry has_req=%s",
+        getattr(self, "dp_rank", "?"), _has_req,
+    )
     if not self.scheduler.has_requests():
         return {}, False
 
@@ -496,6 +516,16 @@ def _patched_step_with_batch_queue(self):
 
     model_executed = False
     deferred_scheduler_output = None
+
+    # [diagnostic] Log scheduler state before scheduling decision
+    _has_req = self.scheduler.has_requests()
+    _has_unf = self.scheduler.has_unfinished_requests()
+    _eng_run = getattr(self, "engines_running", None)
+    vllm_logger.info(
+        "[EDGE-TRACE] dp%s step_entry has_req=%s has_unfin=%s engines_running=%s",
+        getattr(self, "dp_rank", "?"), _has_req, _has_unf, _eng_run,
+    )
+
     if self.scheduler.has_requests():
         # [ascend insert] Pull cloud-returned tail-segment batches into
         # the scheduler ready queues before picking the next batch.
