@@ -71,7 +71,7 @@ from uuid import uuid4
 from vllm.config import ParallelConfig
 from vllm.logger import init_logger, logger as vllm_logger
 from vllm.v1.core.sched.output import BatchType, SchedulerOutput
-from vllm.v1.engine.core import EngineCore, EngineCoreProc
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 from vllm_ascend.v1.engine.passive_core import PPSchedulerZmqChannel
@@ -851,6 +851,30 @@ def _patched_execute_dummy_batch(self):
 
 
 # =======================================================================#
+# DPEngineCoreProc._has_global_unfinished_reqs — avoid all_reduce vs    #
+# all_gather_object conflict on the same dp_group.                     #
+# =======================================================================#
+_ORIG_HAS_GLOBAL_UNFINISHED_REQS = DPEngineCoreProc._has_global_unfinished_reqs
+
+
+@functools.wraps(_ORIG_HAS_GLOBAL_UNFINISHED_REQS)
+def _patched_has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
+    """In pd_separation mode, never trigger the real all_reduce inside
+    ``ParallelConfig.has_unfinished_dp`` because the peer DP may be
+    waiting in ``_sync_phase_allgather`` → ``all_gather_object`` on the
+    same ``dp_group``.  Two different Gloo collectives on one group
+    deadlock.
+
+    Returning ``True`` keeps ``engines_running`` alive so the idle DP
+    always reaches ``execute_dummy_batch`` → ``all_gather_object``,
+    matching the active DP's ``all_gather_object``.
+    """
+    if getattr(self, "_pp_pd_channel", None) is not None:
+        return True
+    return _ORIG_HAS_GLOBAL_UNFINISHED_REQS(self, local_unfinished)
+
+
+# =======================================================================#
 # Install                                                                  #
 # =======================================================================#
 def install() -> None:
@@ -877,6 +901,10 @@ def install() -> None:
 
     EngineCoreProc.run_engine_core = staticmethod(_patched_run_engine_core)
     EngineCoreProc._process_input_queue = _patched_process_input_queue
+
+    DPEngineCoreProc._has_global_unfinished_reqs = (
+        _patched_has_global_unfinished_reqs
+    )
 
     setattr(EngineCore, _INSTALLED_FLAG, True)
     logger.info(
