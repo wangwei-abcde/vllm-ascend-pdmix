@@ -209,9 +209,18 @@ def _publish_batch_phase(self, scheduler_output: SchedulerOutput) -> None:
     Each wave gets its own key to avoid stale data leaking across waves.
     """
     dp_store = getattr(self, "dp_store", None)
+    dp_rank = getattr(self, "dp_rank", "?")
+    bt = scheduler_output.batch_type if scheduler_output else None
+    logger.info(
+        "[DPSTORE PUB] dp=%s wave=%d batch_type=%s dp_store=%s "
+        "has_requests=%s",
+        dp_rank, getattr(self, "current_wave", "?"),
+        bt.value if bt is not None else "<none>",
+        "present" if dp_store is not None else "None",
+        getattr(self.scheduler, "has_requests", lambda: "?")() if hasattr(self, "scheduler") else "?",
+    )
     if dp_store is None:
         return
-    bt = scheduler_output.batch_type if scheduler_output else None
     phase = 0
     if bt in (BatchType.DECODE_FIRST, BatchType.PREFILL_FIRST):
         phase = 1
