@@ -200,49 +200,67 @@ def _drain_pd_channel_inbox(self) -> None:
             )
 
 
-def _publish_batch_phase(self, scheduler_output: SchedulerOutput) -> None:
-    """Write the current batch type phase (FIRST / LAST) to dp_store so
-    idle DPs can read it and decide which dummy segment to run, keeping
-    the cross-DP all-to-all pairing correct.
+def _dp_exchange_status(self, my_status: str) -> str:
+    """Symmetric 2-DP status exchange. Both-working skips the full
+    protocol entirely; working+idle uses done/cleaned handshake.
 
-    Phase encoding: 0 = idle/empty, 1 = FIRST (head), 2 = LAST (tail).
-    Each wave gets its own key to avoid stale data leaking across waves.
+    Keys: status_r0, status_r1, done_r0, done_r1, batch_phase, cleaned
     """
     dp_store = getattr(self, "dp_store", None)
-    dp_rank = getattr(self, "dp_rank", "?")
-    bt = scheduler_output.batch_type if scheduler_output else None
-    vllm_logger.info(
-        "[DPSTORE PUB] dp=%s wave=%d batch_type=%s dp_store=%s "
-        "has_requests=%s",
-        dp_rank, getattr(self, "current_wave", "?"),
-        bt.value if bt is not None else "<none>",
-        "present" if dp_store is not None else "None",
-        getattr(self.scheduler, "has_requests", lambda: "?")() if hasattr(self, "scheduler") else "?",
-    )
+    if dp_store is None:
+        return "working"
+
+    my = int(getattr(self, "dp_rank", 0))
+    other = 1 - my
+
+    # (1) Announce my status; (2) Read other's status
+    dp_store.set(f"status_r{my}", my_status)
+    dp_store.wait([f"status_r{other}"])
+    other_status = dp_store.get(f"status_r{other}")
+    if isinstance(other_status, bytes):
+        other_status = other_status.decode()
+
+    # Same status (both working or both idle): no phase sync needed,
+    # just clean our own key and go
+    if my_status == other_status:
+        dp_store.set(f"status_r{my}", "")
+        return other_status
+
+    # (3) Ack I've read; (4) Wait for other's ack
+    dp_store.set(f"done_r{my}", "1")
+    dp_store.wait([f"done_r{other}"])
+
+    # (5) Working DP cleans ALL keys
+    if my_status == "working":
+        for k in ("status_r0", "status_r1", "done_r0", "done_r1", "batch_phase"):
+            dp_store.set(k, "")
+        dp_store.set("cleaned", "1")
+
+    # (6) Everyone waits for cleanup; idle DP resets confirmation
+    dp_store.wait(["cleaned"])
+    if my_status != "working":
+        dp_store.set("cleaned", "")
+
+    return other_status
+
+
+def _publish_batch_phase(self, scheduler_output: SchedulerOutput) -> None:
+    """Exchange status with the peer DP and, if the peer is idle, write
+    the current batch type phase so it can run a matching dummy segment.
+
+    Phase encoding: 1 = FIRST (head), 2 = LAST (tail).
+    """
+    dp_store = getattr(self, "dp_store", None)
     if dp_store is None:
         return
-    phase = 0
-    if bt in (BatchType.DECODE_FIRST, BatchType.PREFILL_FIRST):
-        phase = 1
-    elif bt in (BatchType.DECODE_LAST, BatchType.PREFILL_LAST):
-        phase = 2
-    # Each wave has its own key.  The active DP overwrites the key on
-    # every schedule() call so the idle DP always reads the latest phase.
-    # NOTE: do NOT include step_counter in the key — step_counter is
-    # incremented in _has_global_unfinished_reqs which is called at the
-    # END of each run_busy_loop iteration, while _publish_batch_phase is
-    # only called in _patched_step() when has_requests() is True.
-    # During "waiting for cloud" iterations the two counters diverge,
-    # leading to dp_store.wait() blocking forever on a key nobody writes.
-    key = f"batch_phase_w{self.current_wave}"
-    dp_rank = getattr(self, "dp_rank", "?")
-    vllm_logger.info(
-        "[DPSTORE PUB] dp=%s wave=%d batch_type=%s phase=%d key=%s",
-        dp_rank, self.current_wave,
-        bt.value if bt is not None else "<none>",
-        phase, key,
-    )
-    dp_store.set(key, str(phase))
+
+    bt = scheduler_output.batch_type if scheduler_output else None
+    phase = 1 if bt in (BatchType.DECODE_FIRST, BatchType.PREFILL_FIRST) else (
+        2 if bt in (BatchType.DECODE_LAST, BatchType.PREFILL_LAST) else 0)
+
+    other_status = self._dp_exchange_status("working")
+    if other_status == "idle":
+        dp_store.set("batch_phase", str(phase))
 
 
 def _maybe_publish_pre_out(
@@ -737,12 +755,8 @@ def _patched_execute_dummy_batch(self):
     rpc_broadcast_mq broadcast (which would deliver it to the DP running
     real work and break cross-DP all_reduce pairing -> deadlock).
 
-    Cloud workers skip the cross-node ``execute_dummy_batch`` (see
-    multiproc_executor.worker_busy_loop), so ``executor.execute_dummy_batch``
-    below only runs the dummy on *this* DP's edge workers. We additionally
-    publish a dummy SchedulerOutput via zmq so the paired cloud DP runs a
-    dummy-middle (see worker._execute_model_cloud `is_pd_dummy` branch) and
-    keeps the cloud-side cross-DP all_reduce paired.
+    Uses symmetric dp_store status exchange to discover whether the peer
+    DP has real work and, if so, which phase (FIRST/LAST) to match.
 
     When PD-separation is off (no ``_pp_pd_channel``) this is identical to
     upstream: just ``executor.execute_dummy_batch()``.
@@ -756,32 +770,19 @@ def _patched_execute_dummy_batch(self):
         )
         from uuid import uuid4
 
-        # Read the active DP's batch phase from dp_store to decide
-        # whether to send a FIRST (head, via zmq → cloud) or LAST
-        # (tail, edge-only) dummy so the cross-DP all-to-all pairs
-        # correctly with the real DP's current segment.
-        #
-        # Uses a per-wave key (no step_counter — see _publish_batch_phase
-        # for rationale).  dp_store.wait([key]) blocks until the active DP
-        # publishes a phase for the current wave.
-        dummy_phase = 1  # default: FIRST
-        try:
-            dp_store = getattr(self, "dp_store", None)
-            if dp_store is not None:
-                key = f"batch_phase_w{self.current_wave}"
-                dp_rank = getattr(self, "dp_rank", "?")
-                vllm_logger.info(
-                    "[DPSTORE WAIT] dp=%s wave=%d key=%s waiting...",
-                    dp_rank, self.current_wave, key,
-                )
-                dp_store.wait([key])
-                dummy_phase = int(dp_store.get(key))
-                vllm_logger.info(
-                    "[DPSTORE READ] dp=%s wave=%d key=%s phase=%d",
-                    dp_rank, self.current_wave, key, dummy_phase,
-                )
-        except Exception:
-            pass
+        dp_store = getattr(self, "dp_store", None)
+
+        if dp_store is not None:
+            other_status = self._dp_exchange_status("idle")
+            if other_status == "idle":
+                return
+
+            # Peer is working — read its phase (working DP cleans this
+            # key in _dp_exchange_status before writing the new value).
+            dp_store.wait(["batch_phase"])
+            dummy_phase = int(dp_store.get("batch_phase"))
+        else:
+            dummy_phase = 1  # default: FIRST (no dp_store fallback)
 
         dummy_so = _SchedulerOutput.make_empty()
         dummy_so.head_token = uuid4().hex
@@ -815,6 +816,7 @@ def install() -> None:
         return
 
     EngineCore.__init__ = _patched_engine_core_init
+    EngineCore._dp_exchange_status = _dp_exchange_status
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
     EngineCore._publish_batch_phase = _publish_batch_phase
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
