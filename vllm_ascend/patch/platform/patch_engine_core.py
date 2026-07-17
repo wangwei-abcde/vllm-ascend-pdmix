@@ -200,86 +200,55 @@ def _drain_pd_channel_inbox(self) -> None:
             )
 
 
-def _dp_exchange_status(self, my_status: str, phase: str = "") -> str:
-    """Symmetric 2-DP status exchange. Both-working skips the full
-    protocol entirely; working+idle uses done/cleaned handshake.
+def _sync_phase_allgather(self, phase: int | None) -> int | None:
+    """Exchange phase info across DP ranks via Gloo all_gather_object.
 
-    When my_status=="working" and phase is set, batch_phase is written
-    BEFORE cleaned so the idle DP always reads a fresh value.
+    All DP ranks call this simultaneously. Each contributes its phase
+    (None=idle, 1=FIRST, 2=LAST). After gather every rank sees all
+    others' phases and the working rank's phase is returned.
 
-    Keys: status_r0, status_r1, done_r0, done_r1, batch_phase, cleaned
+    Returns None when all ranks are idle.
     """
-    dp_store = getattr(self, "dp_store", None)
-    if dp_store is None:
-        return "working"
+    dp_group = getattr(self, "dp_group", None)
+    if dp_group is None:
+        return phase
 
-    my = int(getattr(self, "dp_rank", 0))
-    other = 1 - my
+    import torch.distributed as dist
 
-    # (1) Announce my status; (2) Read other's status
-    dp_store.set(f"status_r{my}", my_status)
-    vllm_logger.info("[DPSTORE] dp%d write status=%s", my, my_status)
-    dp_store.wait([f"status_r{other}"])
-    other_status = dp_store.get(f"status_r{other}")
-    if isinstance(other_status, bytes):
-        other_status = other_status.decode()
-    vllm_logger.info("[DPSTORE] dp%d read dp%d status=%s", my, other, other_status)
+    dp_rank = int(getattr(self, "dp_rank", 0))
+    my_obj = {"has_req": phase is not None and phase != 0, "phase": phase or 0}
+    gathered = [None, None]
+    dist.all_gather_object(gathered, my_obj, group=dp_group)
 
-    # Same status (both working or both idle): no phase sync needed.
-    # Do NOT clean keys here — the next working+idle exchange will do it.
-    if my_status == other_status:
-        if my_status == "working":
-            vllm_logger.info("[DPSTORE] dp%d both working, skip", my)
-        return other_status
+    vllm_logger.info(
+        "[DPGATHER] dp%d my_phase=%s gathered=%s",
+        dp_rank, phase, gathered,
+    )
 
-    # (3) Ack I've read; (4) Wait for other's ack
-    dp_store.set(f"done_r{my}", "1")
-    dp_store.wait([f"done_r{other}"])
-
-    # (5) Working DP: write phase FIRST, then delete all keys + signal.
-    #     delete_key ensures wait() will block until the next write.
-    if my_status == "working":
-        vllm_logger.info("[DPSTORE] dp%d clean+signal phase=%s", my, phase)
-        if phase:
-            dp_store.set("batch_phase", phase)
-        for k in ("status_r0", "status_r1", "done_r0", "done_r1",
-                  "batch_phase", "cleaned"):
-            try:
-                dp_store.delete_key(k)
-            except Exception:
-                pass
-        dp_store.set("cleaned", "1")
-
-    # (6) Everyone waits for cleanup; idle DP resets confirmation
-    dp_store.wait(["cleaned"])
-    if my_status != "working":
-        try:
-            dp_store.delete_key("cleaned")
-        except Exception:
-            pass
-
-    vllm_logger.info("[DPSTORE] dp%d exchange done, other=%s", my, other_status)
-    return other_status
+    for g in gathered:
+        if g["has_req"]:
+            return g["phase"]
+    return None
 
 
 def _publish_batch_phase(self, scheduler_output: SchedulerOutput) -> None:
-    """Exchange status with the peer DP and, if the peer is idle, write
-    the current batch type phase so it can run a matching dummy segment.
+    """Use all_gather_object to sync the current batch phase with the
+    peer DP. The idle DP will receive the phase and run a matching dummy.
 
     Phase encoding: 1 = FIRST (head), 2 = LAST (tail).
     """
-    dp_store = getattr(self, "dp_store", None)
-    if dp_store is None:
+    dp_group = getattr(self, "dp_group", None)
+    if dp_group is None:
         return
 
     bt = scheduler_output.batch_type if scheduler_output else None
     phase = 1 if bt in (BatchType.DECODE_FIRST, BatchType.PREFILL_FIRST) else (
         2 if bt in (BatchType.DECODE_LAST, BatchType.PREFILL_LAST) else 0)
 
-    vllm_logger.info("[DPSTORE] dp%s pub phase=%d bt=%s",
+    vllm_logger.info("[DPGATHER] dp%s pub phase=%d bt=%s",
                      getattr(self, "dp_rank", "?"), phase,
                      bt.value if bt else "none")
-    self._dp_exchange_status("working", str(phase))
+    self._sync_phase_allgather(phase)
 
 
 def _maybe_publish_pre_out(
@@ -789,26 +758,14 @@ def _patched_execute_dummy_batch(self):
         )
         from uuid import uuid4
 
-        dp_store = getattr(self, "dp_store", None)
+        dummy_phase = self._sync_phase_allgather(None)
+        if dummy_phase is None:
+            vllm_logger.info("[DPGATHER] dp%s dummy both idle, skip",
+                             getattr(self, "dp_rank", "?"))
+            return
 
-        if dp_store is not None:
-            other_status = self._dp_exchange_status("idle")
-            if other_status == "idle":
-                vllm_logger.info("[DPSTORE] dp%s dummy both idle, skip",
-                                 getattr(self, "dp_rank", "?"))
-                return
-
-            # Peer is working — read its phase (working DP writes it
-            # before cleaned in _dp_exchange_status).
-            dp_store.wait(["batch_phase"])
-            val = dp_store.get("batch_phase")
-            if isinstance(val, bytes):
-                val = val.decode()
-            dummy_phase = int(val) if val else 1  # defensive: fallback FIRST
-            vllm_logger.info("[DPSTORE] dp%s dummy read phase=%d raw=%r",
-                             getattr(self, "dp_rank", "?"), dummy_phase, val)
-        else:
-            dummy_phase = 1  # default: FIRST (no dp_store fallback)
+        vllm_logger.info("[DPGATHER] dp%s dummy phase=%d",
+                         getattr(self, "dp_rank", "?"), dummy_phase)
 
         dummy_so = _SchedulerOutput.make_empty()
         dummy_so.head_token = uuid4().hex
@@ -842,7 +799,7 @@ def install() -> None:
         return
 
     EngineCore.__init__ = _patched_engine_core_init
-    EngineCore._dp_exchange_status = _dp_exchange_status
+    EngineCore._sync_phase_allgather = _sync_phase_allgather
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
     EngineCore._publish_batch_phase = _publish_batch_phase
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
