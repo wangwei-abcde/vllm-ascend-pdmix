@@ -586,16 +586,16 @@ class AscendFusedMoE(FusedMoE):
     ) -> torch.Tensor | FusedMoEResult:
         assert self.quant_method is not None
 
-        # [DEBUG] Log MoE input stats for sliced vs non-sliced comparison
-        h_f32 = hidden_states.float()
-        r_f32 = router_logits.float()
+        # [DEBUG] Log MoE input hidden_states for sliced vs non-sliced comparison
+        hs_f32 = hidden_states.float()
         logger.info(
-            "[MoE_IN] layer=%s input: h_mean=%.6f h_std=%.6f "
-            "r_mean=%.6f r_std=%.6f shape=%s",
-            self.moe_instance_id,
-            h_f32.mean().item(), h_f32.std().item(),
-            r_f32.mean().item(), r_f32.std().item(),
-            hidden_states.shape,
+            "[MoE_INPUT] layer=%s hidden_states shape=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
+            self.layer_name,
+            tuple(hidden_states.shape),
+            hs_f32.mean().item(),
+            hs_f32.std().item(),
+            hs_f32.min().item(),
+            hs_f32.max().item(),
         )
 
         forward_context = get_forward_context()
@@ -667,10 +667,10 @@ class AscendFusedMoE(FusedMoE):
 
         # [DEBUG] Log MoE prepare shapes for layer-slice diagnosis
         logger.info(
-            "[MoE_DEBUG] layer_id=%s comm_type=%s prepare: "
+            "[MoE_DEBUG] layer=%s comm_type=%s prepare: "
             "in_hidden=%s out_hidden=%s in_router=%s out_router=%s "
             "mc2_mask=%s padded_shape=%s",
-            self.moe_instance_id, _EXTRA_CTX.moe_comm_type,
+            self.layer_name, _EXTRA_CTX.moe_comm_type,
             hidden_states.shape, prepare_output.hidden_states.shape if hasattr(prepare_output, 'hidden_states') else 'N/A',
             router_logits.shape, prepare_output.router_logits.shape if prepare_output.router_logits is not None else 'None',
             mc2_mask.shape if mc2_mask is not None else 'None',
@@ -734,9 +734,9 @@ class AscendFusedMoE(FusedMoE):
 
         # [DEBUG] Log MoE finalize output for layer-slice diagnosis
         logger.info(
-            "[MoE_DEBUG] layer_id=%s finalize: "
+            "[MoE_DEBUG] layer=%s finalize: "
             "fused_out=%s routed_out=%s",
-            self.moe_instance_id,
+            self.layer_name,
             fused_experts_results.routed_out.shape,
             routed_out.shape,
         )
@@ -745,7 +745,7 @@ class AscendFusedMoE(FusedMoE):
         routed_f32 = routed_out.float()
         logger.info(
             "[MoE_VAL] layer=%s routed_out mean=%.6f std=%.6f min=%.6f max=%.6f",
-            self.moe_instance_id,
+            self.layer_name,
             routed_f32.mean().item(),
             routed_f32.std().item(),
             routed_f32.min().item(),
