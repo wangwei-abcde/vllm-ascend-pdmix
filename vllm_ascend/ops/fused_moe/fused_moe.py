@@ -653,6 +653,18 @@ class AscendFusedMoE(FusedMoE):
         padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
         pertoken_scale = prepare_output.pertoken_scale
 
+        # [DEBUG] Log MoE prepare shapes for layer-slice diagnosis
+        logger.info(
+            "[MoE_DEBUG] layer_id=%s comm_type=%s prepare: "
+            "in_hidden=%s out_hidden=%s in_router=%s out_router=%s "
+            "mc2_mask=%s padded_shape=%s",
+            self.moe_instance_id, _EXTRA_CTX.moe_comm_type,
+            hidden_states.shape, prepare_output.hidden_states.shape if hasattr(prepare_output, 'hidden_states') else 'N/A',
+            router_logits.shape, prepare_output.router_logits.shape if prepare_output.router_logits is not None else 'None',
+            mc2_mask.shape if mc2_mask is not None else 'None',
+            padded_hidden_states_shape,
+        )
+
         # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
@@ -706,6 +718,15 @@ class AscendFusedMoE(FusedMoE):
             hidden_states=fused_experts_results.routed_out,
             reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
             padded_hidden_states_shape=padded_hidden_states_shape,
+        )
+
+        # [DEBUG] Log MoE finalize output for layer-slice diagnosis
+        logger.info(
+            "[MoE_DEBUG] layer_id=%s finalize: "
+            "fused_out=%s routed_out=%s",
+            self.moe_instance_id,
+            fused_experts_results.routed_out.shape,
+            routed_out.shape,
         )
 
         if return_with_event:
