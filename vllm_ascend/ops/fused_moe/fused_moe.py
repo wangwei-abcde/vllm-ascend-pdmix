@@ -586,6 +586,23 @@ class AscendFusedMoE(FusedMoE):
     ) -> torch.Tensor | FusedMoEResult:
         assert self.quant_method is not None
 
+        # [DEBUG] Log MoE weight fingerprint to verify correct weights per layer
+        if hasattr(self, 'w13_weight') and hasattr(self, 'w2_weight'):
+            w13 = self.w13_weight
+            w2 = self.w2_weight
+            # Use first element + shape as lightweight fingerprint
+            w13_fp = (tuple(w13.shape), float(w13.float().reshape(-1)[0]), float(w13.float().sum()))
+            w2_fp = (tuple(w2.shape), float(w2.float().reshape(-1)[0]), float(w2.float().sum()))
+            logger.info(
+                "[MoE_WEIGHT] layer=%s w13_shape=%s w13_first=%.6f w13_sum=%.6f "
+                "w2_shape=%s w2_first=%.6f w2_sum=%.6f",
+                self.layer_name,
+                w13_fp[0], w13_fp[1], w13_fp[2],
+                w2_fp[0], w2_fp[1], w2_fp[2],
+            )
+        else:
+            logger.info("[MoE_WEIGHT] layer=%s w13_weight or w2_weight not found", self.layer_name)
+
         # [DEBUG] Log MoE input hidden_states for sliced vs non-sliced comparison
         hs_f32 = hidden_states.float()
         logger.info(
