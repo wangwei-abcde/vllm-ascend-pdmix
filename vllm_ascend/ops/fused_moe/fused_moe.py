@@ -729,6 +729,17 @@ class AscendFusedMoE(FusedMoE):
             routed_out.shape,
         )
 
+        # [DEBUG] Log MoE output numerical stats for sliced vs non-sliced comparison
+        routed_f32 = routed_out.float()
+        logger.info(
+            "[MoE_VAL] layer=%s routed_out mean=%.6f std=%.6f min=%.6f max=%.6f",
+            self.moe_instance_id,
+            routed_f32.mean().item(),
+            routed_f32.std().item(),
+            routed_f32.min().item(),
+            routed_f32.max().item(),
+        )
+
         if return_with_event:
             return FusedMoEResult(
                 routed_out=routed_out,
