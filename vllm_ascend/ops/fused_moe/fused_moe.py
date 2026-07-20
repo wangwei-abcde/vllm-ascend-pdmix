@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
@@ -702,6 +703,7 @@ class AscendFusedMoE(FusedMoE):
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
 
         # Matrix multiply.
+        _moe_t0 = time.time()
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -724,6 +726,12 @@ class AscendFusedMoE(FusedMoE):
             log2phy=self.log2phy,
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask,
+        )
+        torch.npu.synchronize()
+        _moe_t1 = time.time()
+        logger.info(
+            "[PERF_MOE] layer=%s forward_time=%.3fms",
+            self.layer_name, (_moe_t1 - _moe_t0) * 1000,
         )
 
         if self.dynamic_eplb:

@@ -4770,10 +4770,22 @@ class NPUModelRunner(GPUModelRunner):
                     moe_start,
                     len(forward_context.all_moe_layers),
                 )
+        _slice_t0 = time.time()
         hidden_states = seg_c(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             **model_kwargs,
+        )
+        torch.npu.synchronize()
+        _slice_t1 = time.time()
+        _slice_tag = (
+            f"slice={layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices}"
+            if layer_slice_info is not None else "full"
+        )
+        logger.info(
+            "[PERF_SLICE] %s seg_c_time=%.3fms capturing=%s",
+            _slice_tag, (_slice_t1 - _slice_t0) * 1000,
+            forward_context.capturing if forward_context is not None else "N/A",
         )
         if seg_c_graph and not forward_context.capturing:
             self._update_full_graph_params_if_needed(
