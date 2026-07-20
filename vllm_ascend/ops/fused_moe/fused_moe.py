@@ -586,6 +586,18 @@ class AscendFusedMoE(FusedMoE):
     ) -> torch.Tensor | FusedMoEResult:
         assert self.quant_method is not None
 
+        # [DEBUG] Log MoE input stats for sliced vs non-sliced comparison
+        h_f32 = hidden_states.float()
+        r_f32 = router_logits.float()
+        logger.info(
+            "[MoE_IN] layer=%s input: h_mean=%.6f h_std=%.6f "
+            "r_mean=%.6f r_std=%.6f shape=%s",
+            self.moe_instance_id,
+            h_f32.mean().item(), h_f32.std().item(),
+            r_f32.mean().item(), r_f32.std().item(),
+            hidden_states.shape,
+        )
+
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice (compilation + capture),
         # causing moe_layer_index to overflow. Wrap the index to prevent out-of-bounds errors.
