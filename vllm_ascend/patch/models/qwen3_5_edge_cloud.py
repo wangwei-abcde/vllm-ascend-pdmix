@@ -45,6 +45,13 @@ def _forward_edge_cloud_segment_qwen3_5(
         f"Invalid segment range [{start_layer}, {end_layer}) for {num_layers} layers"
     )
 
+    # [DEBUG] Log layer range received by forward_edge_cloud_segment
+    from vllm.logger import logger as vllm_logger
+    vllm_logger.info(
+        "[SLICE_RANGE] forward_edge_cloud_segment: start=%s end=%s num_layers=%s",
+        start_layer, end_layer, num_layers,
+    )
+
     if is_first_segment is None:
         is_first_segment = start_layer == 0 and get_pp_group().is_first_rank
     if is_last_segment is None:

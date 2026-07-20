@@ -308,6 +308,17 @@ class EdgeCloudSegment(torch.nn.Module):
         end_layer = extra_layer_kwargs.pop(
             "layer_slice_end", self._end_layer
         )
+        # [DEBUG] Log layer range received by EdgeCloudSegment
+        from vllm.logger import logger as vllm_logger
+        vllm_logger.info(
+            "[SLICE_RANGE] EdgeCloudSegment: layer_slice_start=%s layer_slice_end=%s "
+            "default_start=%s default_end=%s => final [%s, %s) "
+            "extra_kwargs_keys=%s",
+            start_layer, end_layer,
+            self._start_layer, self._end_layer,
+            start_layer, end_layer,
+            list(extra_layer_kwargs.keys()),
+        )
         return self._edge_model.forward_edge_cloud_segment(
             start_layer,
             end_layer,
@@ -4715,6 +4726,18 @@ class NPUModelRunner(GPUModelRunner):
             )
             model_kwargs["layer_slice_end"] = (
                 layer_slice_info.end_layer + self.head_k
+            )
+            # [DEBUG] Log model_kwargs passed to seg_c
+            logger.info(
+                "[SLICE_RANGE] _edge_cloud_forward_cloud: "
+                "slice=%s/%s local=[%s,%s) head_k=%s "
+                "model_kwargs keys=%s",
+                layer_slice_info.slice_index + 1,
+                layer_slice_info.total_slices,
+                layer_slice_info.start_layer,
+                layer_slice_info.end_layer,
+                self.head_k,
+                list(model_kwargs.keys()),
             )
             if not layer_slice_info.is_last_slice:
                 model_kwargs["layer_slice_return_intermediate"] = True
