@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import logging
 import math
 import os
 import sys
@@ -4458,6 +4459,21 @@ class NPUModelRunner(GPUModelRunner):
 
         has_encoder_input = False
         clear_kv_metadata = self.speculative_config is None
+
+        # [DEBUG] Verify num_actual_tokens mismatch hypothesis for MoE layer-slice issue
+        actual_scheduled = self._layerwise_scheduler_output.total_num_scheduled_tokens
+        if actual_scheduled != num_tokens_padded:
+            logger.warning(
+                "[LayerSlice] num_actual_tokens MISMATCH: "
+                "slice=(%s,%s) is_last=%s total_num_scheduled_tokens=%s "
+                "num_tokens_padded=%s delta=%s. "
+                "Using num_tokens_padded will incorrectly include %s padding tokens in mc2_mask!",
+                layer_slice_info.start_layer, layer_slice_info.end_layer,
+                layer_slice_info.is_last_slice,
+                actual_scheduled, num_tokens_padded,
+                num_tokens_padded - actual_scheduled,
+                num_tokens_padded - actual_scheduled,
+            )
 
         with (
             record_function_or_nullcontext("layerwise forward"),
