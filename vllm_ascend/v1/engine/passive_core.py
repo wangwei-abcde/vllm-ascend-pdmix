@@ -219,6 +219,40 @@ class PPSchedulerZmqSubscriber:
                     continue
                 with self._lock:
                     self._received_outputs.append((seq, scheduler_output))
+
+                # [DPDS-DEBUG] 检查反序列化后的关键字段
+                _bt = scheduler_output.batch_type.value
+                _num_sched = len(scheduler_output.num_scheduled_tokens)
+                _total_tokens = scheduler_output.total_num_scheduled_tokens
+                _finished_cnt = len(scheduler_output.finished_req_ids)
+                _head_token = getattr(scheduler_output, "head_token", None)
+                _hidden_ch = getattr(scheduler_output, "hidden_channel", None)
+                _hidden_ch_val = _hidden_ch.value if _hidden_ch is not None else "N/A"
+                logger.info(
+                    "[DPDS-DEBUG][ZMQ-RECV] seq=%d batch_type=%s "
+                    "num_scheduled_reqs=%d total_tokens=%d "
+                    "finished_req_ids_count=%d head_token=%s hidden_channel=%s",
+                    seq, _bt, _num_sched, _total_tokens,
+                    _finished_cnt, _head_token, _hidden_ch_val,
+                )
+
+                # [DPDS-DEBUG] 检查 scheduled_cached_reqs 的 all_token_ids
+                _cached = scheduler_output.scheduled_cached_reqs
+                if _cached is not None:
+                    _all_token_ids = getattr(_cached, "all_token_ids", {}) or {}
+                    _num_output_by_req = dict(zip(
+                        getattr(_cached, "req_ids", ()),
+                        getattr(_cached, "num_output_tokens", ()),
+                    ))
+                    for _rid, _tids in _all_token_ids.items():
+                        _tids_len = len(_tids) if _tids is not None else 0
+                        _nout = _num_output_by_req.get(_rid, "?")
+                        logger.info(
+                            "[DPDS-DEBUG][ZMQ-CACHED-REQ] req_id=%s "
+                            "num_output_tokens=%s all_token_ids_len=%d",
+                            _rid, str(_nout), _tids_len,
+                        )
+
                 logger.info(
                     "PP rank1 received SchedulerOutput seq=%d, "
                     "total_scheduled_tokens=%d, "

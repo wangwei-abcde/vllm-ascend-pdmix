@@ -187,6 +187,22 @@ def _drain_pd_channel_inbox(self) -> None:
     new_outputs = self._pp_pd_channel.consume_new_outputs()
     for _seq, so in new_outputs:
         bt = so.batch_type
+
+        # [DPDS-DEBUG] Edge 收到 Cloud 返回的 POST_OUT
+        _prefills_q = len(self.scheduler.prefills_last_ready)
+        _decodes_q = len(self.scheduler.decodes_last_ready)
+        logger.info(
+            "[DPDS-DEBUG][POST-OUT-RECV] seq=%d batch_type=%s "
+            "head_token=%s hidden_channel=%s "
+            "prefills_last_ready_before=%d decodes_last_ready_before=%d "
+            "scheduled_req_ids=%s",
+            _seq, bt.value if bt is not None else "<none>",
+            getattr(so, "head_token", "N/A"),
+            getattr(so, "hidden_channel", "N/A"),
+            _prefills_q, _decodes_q,
+            list(getattr(so, "num_scheduled_tokens", {}).keys())[:5],
+        )
+
         logger.info(f"Received scheduler_output from cloud, batch_type: {bt}")
         if bt == BatchType.PREFILL_LAST:
             self.scheduler.prefills_last_ready.append(so)
@@ -218,6 +234,20 @@ def _maybe_publish_pre_out(
         return
     bt = scheduler_output.batch_type
     if bt == BatchType.DECODE_FIRST:
+        # [DPDS-DEBUG] Edge 发送 PRE_OUT 给 Cloud
+        _prefills_q = len(getattr(self.scheduler, "prefills_last_ready", []))
+        _decodes_q = len(getattr(self.scheduler, "decodes_last_ready", []))
+        logger.info(
+            "[DPDS-DEBUG][PRE-OUT-SEND] batch_type=%s head_token=%s "
+            "hidden_channel=%s "
+            "prefills_last_ready=%d decodes_last_ready=%d "
+            "scheduled_req_ids=%s",
+            bt.value,
+            getattr(scheduler_output, "head_token", "N/A"),
+            getattr(scheduler_output, "hidden_channel", "N/A"),
+            _prefills_q, _decodes_q,
+            list(scheduler_output.num_scheduled_tokens.keys())[:5],
+        )
         self._pp_pd_channel.publish(scheduler_output)
     elif bt in (
         BatchType.EMPTY,

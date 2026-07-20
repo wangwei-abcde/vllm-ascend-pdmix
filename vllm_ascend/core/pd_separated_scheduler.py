@@ -415,6 +415,20 @@ class PDSeparatedScheduler(Scheduler):
                     )
                     self.prefill_inflight_count += 1
 
+                    # [DPDS-DEBUG] PD 调度状态日志
+                    logger.info(
+                        "[DPDS-DEBUG][PD-BATCH] batch_type=%s head_token=%s "
+                        "hidden_channel=%s "
+                        "scheduled_req_ids=%s "
+                        "prefill_inflight=%d/%d decode_inflight=%d/%d",
+                        scheduler_output.batch_type.value,
+                        scheduler_output.head_token,
+                        scheduler_output.hidden_channel.value,
+                        list(scheduler_output.num_scheduled_tokens.keys()),
+                        self.prefill_inflight_count, self.prefill_inflight_limit,
+                        self.decode_inflight_count, self.decode_inflight_limit,
+                    )
+
                     # === 核心修改 ===
                     # All requests scheduled in this PF batch enter
                     # prefill_last_pending immediately. They may NOT be
@@ -459,6 +473,21 @@ class PDSeparatedScheduler(Scheduler):
         assert so.batch_type == BatchType.PREFILL_LAST, (
             f"prefills_last_ready expects PREFILL_LAST, got {so.batch_type}"
         )
+
+        # [DPDS-DEBUG] PD 调度状态日志 (PREFILL_LAST)
+        logger.info(
+            "[DPDS-DEBUG][PD-BATCH] batch_type=%s head_token=%s "
+            "hidden_channel=%s "
+            "scheduled_req_ids=%s "
+            "prefill_inflight=%d/%d decode_inflight=%d/%d",
+            so.batch_type.value,
+            getattr(so, "head_token", "N/A"),
+            getattr(so, "hidden_channel", "N/A"),
+            list(so.num_scheduled_tokens.keys()),
+            self.prefill_inflight_count, self.prefill_inflight_limit,
+            self.decode_inflight_count, self.decode_inflight_limit,
+        )
+
         # Drop these reqs from chunk_prefill_first. Keep them in
         # prefill_last_pending until update_from_output() moves them to running.
         last_req_ids = set(so.num_scheduled_tokens.keys())
@@ -502,6 +531,21 @@ class PDSeparatedScheduler(Scheduler):
         )
         self._validate_decode_tail_channel(so)
         self._force_decode_last = False
+
+        # [DPDS-DEBUG] PD 调度状态日志 (DECODE_LAST)
+        logger.info(
+            "[DPDS-DEBUG][PD-BATCH] batch_type=%s head_token=%s "
+            "hidden_channel=%s "
+            "scheduled_req_ids=%s "
+            "prefill_inflight=%d/%d decode_inflight=%d/%d ",
+            so.batch_type.value,
+            getattr(so, "head_token", "N/A"),
+            getattr(so, "hidden_channel", "N/A"),
+            list(so.num_scheduled_tokens.keys()),
+            self.prefill_inflight_count, self.prefill_inflight_limit,
+            self.decode_inflight_count, self.decode_inflight_limit,
+        )
+
         return so
 
     def _ensure_cached_all_token_ids(
@@ -576,6 +620,22 @@ class PDSeparatedScheduler(Scheduler):
                     self.decode_inflight_count += 1
                     self._force_decode_last = True
                     self._start_decode_last_delay()
+
+                    # [DPDS-DEBUG] PD 调度状态日志 (DECODE_FIRST)
+                    logger.info(
+                        "[DPDS-DEBUG][PD-BATCH] batch_type=%s head_token=%s "
+                        "hidden_channel=%s "
+                        "scheduled_req_ids=%s "
+                        "prefill_inflight=%d/%d decode_inflight=%d/%d "
+                        "force_decode_last=%s",
+                        scheduler_output.batch_type.value,
+                        scheduler_output.head_token,
+                        scheduler_output.hidden_channel.value,
+                        list(scheduler_output.num_scheduled_tokens.keys()),
+                        self.prefill_inflight_count, self.prefill_inflight_limit,
+                        self.decode_inflight_count, self.decode_inflight_limit,
+                        self._force_decode_last,
+                    )
                 for req in list(self.waiting):
                     saved_waiting.prepend_request(req)
                 self.chunk_prefill_first = saved_chunk_prefill_first
