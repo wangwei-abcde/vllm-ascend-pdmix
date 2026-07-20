@@ -594,14 +594,17 @@ class AscendFusedMoE(FusedMoE):
             w13_fp = (tuple(w13.shape), float(w13.float().reshape(-1)[0]), float(w13.float().sum()))
             w2_fp = (tuple(w2.shape), float(w2.float().reshape(-1)[0]), float(w2.float().sum()))
             logger.info(
-                "[MoE_WEIGHT] layer=%s w13_shape=%s w13_first=%.6f w13_sum=%.6f "
+                "[MoE_WEIGHT] layer=%s id_self=%s id_w13=%s id_w2=%s "
+                "w13_shape=%s w13_first=%.6f w13_sum=%.6f "
                 "w2_shape=%s w2_first=%.6f w2_sum=%.6f",
                 self.layer_name,
+                id(self), id(w13), id(w2),
                 w13_fp[0], w13_fp[1], w13_fp[2],
                 w2_fp[0], w2_fp[1], w2_fp[2],
             )
         else:
-            logger.info("[MoE_WEIGHT] layer=%s w13_weight or w2_weight not found", self.layer_name)
+            logger.info("[MoE_WEIGHT] layer=%s id_self=%s w13_weight or w2_weight not found",
+                        self.layer_name, id(self))
 
         # [DEBUG] Log MoE input hidden_states for sliced vs non-sliced comparison
         hs_f32 = hidden_states.float()

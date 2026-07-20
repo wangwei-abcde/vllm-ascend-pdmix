@@ -71,7 +71,13 @@ def _forward_edge_cloud_segment_qwen3_5(
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
 
-    for layer in islice(self.layers, start_layer, end_layer):
+    # [DEBUG] Log each layer's id() to verify distinct objects across slices
+    from itertools import islice as _islice
+    for idx, layer in enumerate(_islice(self.layers, start_layer, end_layer), start=start_layer):
+        vllm_logger.info(
+            "[LAYER_ID] segment=[%s,%s) global_idx=%s layer_id=%s type=%s",
+            start_layer, end_layer, idx, id(layer), type(layer).__name__,
+        )
         hidden_states, residual = layer(
             hidden_states=hidden_states,
             residual=residual,
