@@ -131,6 +131,7 @@ class PassiveScheduler:
         # (dp>1 + MoE + PD-separation), schedule() coordinates with the
         # peer cloud DP before dispatching.
         self.dp_coord_group = dp_coord_group
+        self._cloud_coord_step = 0  # monotonic step counter for [CLOUD-COORD] logs
 
         self.ready_prefills: deque[SchedulerOutput] = deque()
         self.ready_pdmixes: deque[SchedulerOutput] = deque()
@@ -624,12 +625,14 @@ class PassiveScheduler:
                 getattr(self.vllm_config, "parallel_config", None),
                 "data_parallel_rank", "?",
             )
+            self._cloud_coord_step += 1
+            _step = self._cloud_coord_step
             intended = self._intended_batch_type()
             logger.info(
-                "[CLOUD-COORD] schedule entry: dp_rank=%s intended=%s "
+                "[CLOUD-COORD] step=%s schedule entry: dp_rank=%s intended=%s "
                 "ready_prefills=%d ready_decodes=%d ready_pdmixes=%d "
                 "active_slices=%d state=%s",
-                _dp_rank,
+                _step, _dp_rank,
                 intended.value if intended is not None else "None",
                 len(self.ready_prefills),
                 len(self.ready_decodes),
@@ -637,19 +640,19 @@ class PassiveScheduler:
                 len(self._active_prefill_slices),
                 self.cloud_scheduling_state.value,
             )
-            winner = self._coordinate_bt(intended)
+            winner = self._coordinate_bt(intended, _step)
             if winner is None:
                 logger.info(
-                    "[CLOUD-COORD] all idle, returning empty: dp_rank=%s",
-                    _dp_rank,
+                    "[CLOUD-COORD] step=%s all idle, returning empty: dp_rank=%s",
+                    _step, _dp_rank,
                 )
                 return ScheduledBatch.empty()
             result = self._schedule_target(winner)
             _so = result.scheduler_output if not result.is_empty() else None
             logger.info(
-                "[CLOUD-COORD] dispatch result: dp_rank=%s winner=%s "
+                "[CLOUD-COORD] step=%s dispatch result: dp_rank=%s winner=%s "
                 "is_empty=%s bt=%s tokens=%s slices=%d",
-                _dp_rank,
+                _step, _dp_rank,
                 winner.value if winner is not None else "None",
                 result.is_empty(),
                 _so.batch_type.value if _so is not None and _so.batch_type is not None else "None",
@@ -832,7 +835,7 @@ class PassiveScheduler:
         return ScheduledBatch.empty()
 
     def _coordinate_bt(
-        self, intended_bt: BatchType | None
+        self, intended_bt: BatchType | None, step: int = 0
     ) -> BatchType | None:
         """All-reduce intended batch_type category across cloud DPs.
 
@@ -847,8 +850,8 @@ class PassiveScheduler:
             "data_parallel_rank", "?",
         )
         logger.info(
-            "[CLOUD-COORD] _coordinate_bt: dp_rank=%s intended=%s my_cat=%d",
-            _dp_rank,
+            "[CLOUD-COORD] step=%s _coordinate_bt: dp_rank=%s intended=%s my_cat=%d",
+            step, _dp_rank,
             intended_bt.value if intended_bt is not None else "None",
             my_cat,
         )
@@ -857,8 +860,8 @@ class PassiveScheduler:
         dist.all_reduce(tensor, group=self.dp_coord_group, op=dist.ReduceOp.MIN)
         winner_cat = tensor.item()
         logger.info(
-            "[CLOUD-COORD] _coordinate_bt result: dp_rank=%s winner_cat=%d",
-            _dp_rank,
+            "[CLOUD-COORD] step=%s _coordinate_bt result: dp_rank=%s winner_cat=%d",
+            step, _dp_rank,
             winner_cat,
         )
         # MIN on categories where 0=EMPTY < 1=prefill < 2=decode < 3=pdmix
