@@ -121,11 +121,16 @@ class PassiveScheduler:
         pp_subscriber: "PPSchedulerZmqSubscriber",
         dispatch_policy: DispatchPolicy = DispatchPolicy.EXPECT_ALTERNATION,
         run_subscriber_thread: bool = True,
+        dp_coord_group: "torch.distributed.ProcessGroup | None" = None,
     ) -> None:
         self.pp_subscriber = pp_subscriber
         self.vllm_config = vllm_config
         self.dispatch_policy = dispatch_policy
         self.cloud_scheduling_state = CloudSchedulingState.EXPECT_EXECUTE_PREFILL
+        # Optional cross-DP coordination group (cloud side). When set
+        # (dp>1 + MoE + PD-separation), schedule() coordinates with the
+        # peer cloud DP before dispatching.
+        self.dp_coord_group = dp_coord_group
 
         self.ready_prefills: deque[SchedulerOutput] = deque()
         self.ready_pdmixes: deque[SchedulerOutput] = deque()
@@ -281,7 +286,18 @@ class PassiveScheduler:
             # than the other (e.g. seq=282 vs 68 for the real PREFILL_FIRST).
             _total = scheduler_output.total_num_scheduled_tokens
             if _total == 0:
-                _kind = "DUMMY"
+                # Under unified scheduling (cross-DP coordination), the edge
+                # publishes a dummy SchedulerOutput with the winner's bt
+                # (e.g. PREFILL_FIRST for prefill dummy, DECODE_FIRST for
+                # decode dummy) so the cloud can tell which kind of dummy it
+                # is.  The ``is_pd_dummy`` attr is lost in ZMQ serialization;
+                # batch_type + tokens==0 is the reliable on-wire indicator.
+                if bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
+                    _kind = "DUMMY_PREFILL"
+                elif bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
+                    _kind = "DUMMY_DECODE"
+                else:
+                    _kind = "DUMMY"
             elif bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
                 _kind = "REAL_PREFILL"
             elif bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
@@ -590,13 +606,26 @@ class PassiveScheduler:
         )
         return False
 
-    def schedule(self) -> ScheduledBatch:
+    def schedule(self, coordinated: bool = False) -> ScheduledBatch:
         """Pick the next SchedulerOutput to dispatch.
 
         ``EXPECT_ALTERNATION`` implements the Phase7 cloud-side EEP/EED state
         machine.  Sliced prefill-like batches are dispatched one slice per call
         so decode batches can be interleaved between the remaining slices.
+
+        When ``coordinated`` is True (cloud-side cross-DP coordination active):
+        1. Query intended batch_type (read-only, no side effects).
+        2. All-reduce across cloud DPs via ``dp_coord_group`` to agree on
+           a winner bt.
+        3. Force-schedule the winner via ``_schedule_target``.
         """
+        if coordinated and self.dp_coord_group is not None:
+            intended = self._intended_batch_type()
+            winner = self._coordinate_bt(intended)
+            if winner is None:
+                return ScheduledBatch.empty()
+            return self._schedule_target(winner)
+
         if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
             return self._schedule_expect_alternation()
 
@@ -606,6 +635,157 @@ class PassiveScheduler:
                 return batch
 
         return ScheduledBatch.empty()
+
+    # ------------------------------------------------------------------ #
+    # Cross-DP coordination helpers (cloud side)                          #
+    # ------------------------------------------------------------------ #
+
+    # batch_type → id mapping for the coordination all_reduce.
+    # 0 = EMPTY/idle, 1 = prefill-like (any), 2 = decode-like (any),
+    # 3 = pdmix.  Only three categories because the cloud dispatches
+    # based on queue type, not the fine-grained PF/PL/DF/DL distinction
+    # (the edge head/tail split is irrelevant on the cloud side).
+    _BT_COORD_ID: dict = {
+        None: 0,
+    }
+    _BT_COORD_ID_INV: dict[int, BatchType | None] = {v: k for k, v in _BT_COORD_ID.items()}
+
+    def _bt_to_coord_category(self, bt: BatchType | None) -> int:
+        """Map a batch_type to its coordination category id.
+
+        Categories (cloud-side):
+            0 = EMPTY / nothing to dispatch
+            1 = prefill-like (PURE_PREFILL, PREFILL_FIRST)
+            2 = decode-like (PURE_DECODE, DECODE_FIRST)
+            3 = pdmix
+        """
+        if bt is None:
+            return 0
+        if bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
+            return 1
+        if bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
+            return 2
+        if bt == BatchType.PD_MIX:
+            return 3
+        return 0
+
+    def _coord_category_to_bt(self, cat: int) -> BatchType | None:
+        """Map a coordination category id back to a representative batch_type.
+        Used as a key for _schedule_target.
+        """
+        if cat == 1:
+            return BatchType.PREFILL_FIRST
+        if cat == 2:
+            return BatchType.DECODE_FIRST
+        if cat == 3:
+            return BatchType.PD_MIX
+        return None
+
+    def _intended_batch_type(self) -> BatchType | None:
+        """Read-only query: what batch_type would ``schedule()`` pick next,
+        without any side effects (no queue popping, no state transitions).
+
+        Returns the batch_type or None if nothing is available.
+        """
+        # Active sliced prefill continuation always has priority.
+        if self._active_prefill_slices and self._active_sliced_prefill is not None:
+            return self._active_sliced_prefill.batch_type
+
+        if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
+            state = self.cloud_scheduling_state
+            if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
+                if self.ready_prefills:
+                    return self.ready_prefills[0].batch_type
+                if self.ready_decodes:
+                    return self.ready_decodes[0].batch_type
+            else:  # EXPECT_EXECUTE_DECODE
+                if self.ready_decodes:
+                    return self.ready_decodes[0].batch_type
+                if self._can_fallback_to_prefill_in_decode_state():
+                    if self.ready_prefills:
+                        return self.ready_prefills[0].batch_type
+            if self.ready_pdmixes:
+                return self.ready_pdmixes[0].batch_type
+            return None
+
+        # Other policies: walk queues in priority order.
+        for queue_name in self._POLICY_ORDER[self.dispatch_policy]:
+            if queue_name == "ready_decodes" and self._active_prefill_slices:
+                continue  # active prefill slices block prefill-like queues
+            q: deque = getattr(self, queue_name)
+            if q:
+                return q[0].batch_type
+        return None
+
+    def _schedule_target(self, target_bt: BatchType) -> ScheduledBatch:
+        """Force-schedule from the queue matching ``target_bt``.
+
+        Maps the target batch_type to the appropriate ready queue and
+        dispatches from it (with slicing if applicable).  If the queue
+        is empty, returns an empty batch.
+
+        IMPORTANT: when an active sliced prefill continuation exists AND
+        its batch_type matches the target, dispatch from
+        ``_active_prefill_slices`` instead of the ready queue.  The
+        ready queue was already consumed by the slice-0 dispatch and the
+        remaining slices live only in ``_active_prefill_slices``.
+        Skipping this check would silently drop N-1 slices and cause
+        cross-DP all-toall shape divergence (deadlock).
+        """
+        # Active sliced prefill / pdmix continuation takes priority over
+        # the ready queue — the ready queue was consumed by slice-0.
+        if self._active_prefill_slices and self._active_sliced_prefill is not None:
+            _active_bt = self._active_sliced_prefill.batch_type
+            if (
+                _active_bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST)
+                and target_bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST)
+            ):
+                return self._build_active_prefill_slice_batch()
+            if (
+                _active_bt == BatchType.PD_MIX
+                and target_bt == BatchType.PD_MIX
+            ):
+                return self._build_active_prefill_slice_batch()
+
+        # Route to the correct queue.
+        if target_bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
+            if self.ready_prefills:
+                return self._build_batch(self.ready_prefills.popleft())
+        elif target_bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
+            if self.ready_decodes:
+                return self._build_batch(self.ready_decodes.popleft())
+        elif target_bt == BatchType.PD_MIX:
+            if self.ready_pdmixes:
+                return self._build_batch(self.ready_pdmixes.popleft())
+
+        # Queue empty: nothing to dispatch for this target.
+        return ScheduledBatch.empty()
+
+    def _coordinate_bt(
+        self, intended_bt: BatchType | None
+    ) -> BatchType | None:
+        """All-reduce intended batch_type category across cloud DPs.
+
+        Uses ``self.dp_coord_group`` (stateless ProcessGroup).  Rule:
+        lowest-dp-rank DP with real (non-0) intent wins.  Returns the
+        winner batch_type, or None if all DPs are idle.
+        """
+        import torch
+        my_cat = self._bt_to_coord_category(intended_bt)
+        tensor = torch.tensor([my_cat], dtype=torch.int32)
+        import torch.distributed as dist
+        dist.all_reduce(tensor, group=self.dp_coord_group, op=dist.ReduceOp.MIN)
+        winner_cat = tensor.item()
+        # MIN on categories where 0=EMPTY < 1=prefill < 2=decode < 3=pdmix
+        # gives the lowest non-zero category across DPs → first-category
+        # wins.  If all are 0, result is 0 → None.
+        if winner_cat == 0:
+            return None
+        return self._coord_category_to_bt(winner_cat)
+
+    def is_coordinated(self) -> bool:
+        """True when cloud-side cross-DP coordination is active."""
+        return self.dp_coord_group is not None
 
     @staticmethod
     def _compute_slice_boundaries(
