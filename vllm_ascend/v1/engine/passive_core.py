@@ -966,14 +966,14 @@ class PassiveEngineCoreProc:
                         vllm_config.parallel_config,
                         "data_parallel_rank", 0,
                     )
-                    _master_ip = getattr(
-                        vllm_config.parallel_config,
-                        "data_parallel_master_ip",
-                        vllm_config.parallel_config.master_addr,
-                    )
+                    # Both cloud PassiveEngineCore processes are colocated
+                    # on the same cloud machine — use localhost for the
+                    # TCP rendezvous.  master_addr / data_parallel_master_ip
+                    # points to the edge machine, which has no gloo server
+                    # on this port.
                     dp_coord_group = (
                         stateless_init_torch_distributed_process_group(
-                            host=_master_ip,
+                            host="127.0.0.1",
                             port=_coord_port,
                             rank=_dp_rank,
                             world_size=_dp_size,
