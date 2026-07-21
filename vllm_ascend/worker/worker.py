@@ -789,7 +789,9 @@ class NPUWorker(WorkerBase):
                 f"slice: {layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices}, "
                 f"layers: [{layer_slice_info.start_layer},{layer_slice_info.end_layer})"
                 if layer_slice_info is not None
-                else ""
+                else "slice: N/A"
+            ) + (
+                f", tokens={scheduler_output.total_num_scheduled_tokens}"
             )
         )
         intermediate_tensors = None

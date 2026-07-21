@@ -638,6 +638,11 @@ class PassiveEngineCoreProc:
             True if at least one payload was enqueued, False if the
             scheduler had nothing to dispatch.
         """
+        _dp_rank = getattr(
+            self.vllm_config.parallel_config, "data_parallel_rank", "?")
+        _step_cnt = getattr(self, "_cloud_step_count", 0) + 1
+        self._cloud_step_count = _step_cnt
+
         self._drain_worker_completion_acks()
         self.passive_scheduler.poll_and_classify()
 
@@ -663,6 +668,17 @@ class PassiveEngineCoreProc:
         if _coordinated:
             _intended_bt = self.passive_scheduler._intended_batch_type()
             _coord_winner = self._coordinate_bt(_intended_bt)
+            logger.info("[CLOUD-STEP] %s coord DONE: dp_rank=%s "
+                        "intended=%s winner=%s "
+                        "rp=%d rd=%d rpd=%d as=%d",
+                        _step_cnt, _dp_rank,
+                        _intended_bt.value if _intended_bt is not None else "None",
+                        _coord_winner.value if _coord_winner is not None else "None",
+                        len(self.passive_scheduler.ready_prefills),
+                        len(self.passive_scheduler.ready_decodes),
+                        len(self.passive_scheduler.ready_pdmixes),
+                        len(self.passive_scheduler._active_prefill_slices),
+                        )
             if _coord_winner is None:
                 # Both DPs idle — dispatch a dummy decode on both sides
                 # unconditionally (force_dummy avoids touching ready
