@@ -620,11 +620,43 @@ class PassiveScheduler:
         3. Force-schedule the winner via ``_schedule_target``.
         """
         if coordinated and self.dp_coord_group is not None:
+            _dp_rank = getattr(
+                getattr(self.vllm_config, "parallel_config", None),
+                "data_parallel_rank", "?",
+            )
             intended = self._intended_batch_type()
+            logger.info(
+                "[CLOUD-COORD] schedule entry: dp_rank=%s intended=%s "
+                "ready_prefills=%d ready_decodes=%d ready_pdmixes=%d "
+                "active_slices=%d state=%s",
+                _dp_rank,
+                intended.value if intended is not None else "None",
+                len(self.ready_prefills),
+                len(self.ready_decodes),
+                len(self.ready_pdmixes),
+                len(self._active_prefill_slices),
+                self.cloud_scheduling_state.value,
+            )
             winner = self._coordinate_bt(intended)
             if winner is None:
+                logger.info(
+                    "[CLOUD-COORD] all idle, returning empty: dp_rank=%s",
+                    _dp_rank,
+                )
                 return ScheduledBatch.empty()
-            return self._schedule_target(winner)
+            result = self._schedule_target(winner)
+            _so = result.scheduler_output if not result.is_empty() else None
+            logger.info(
+                "[CLOUD-COORD] dispatch result: dp_rank=%s winner=%s "
+                "is_empty=%s bt=%s tokens=%s slices=%d",
+                _dp_rank,
+                winner.value if winner is not None else "None",
+                result.is_empty(),
+                _so.batch_type.value if _so is not None and _so.batch_type is not None else "None",
+                _so.total_num_scheduled_tokens if _so is not None else -1,
+                len(result.slices) if not result.is_empty() else 0,
+            )
+            return result
 
         if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
             return self._schedule_expect_alternation()
@@ -740,23 +772,61 @@ class PassiveScheduler:
                 _active_bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST)
                 and target_bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST)
             ):
-                return self._build_active_prefill_slice_batch()
+                result = self._build_active_prefill_slice_batch()
+                logger.info(
+                    "[CLOUD-COORD] _schedule_target: dispatched from active_slices "
+                    "slice_index=%s",
+                    result.slices[0].slice_index if result.slices and result.slices[0] else "None",
+                )
+                return result
             if (
                 _active_bt == BatchType.PD_MIX
                 and target_bt == BatchType.PD_MIX
             ):
-                return self._build_active_prefill_slice_batch()
+                result = self._build_active_prefill_slice_batch()
+                logger.info(
+                    "[CLOUD-COORD] _schedule_target: dispatched from active_slices (pdmix) "
+                    "slice_index=%s",
+                    result.slices[0].slice_index if result.slices and result.slices[0] else "None",
+                )
+                return result
 
         # Route to the correct queue.
         if target_bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
             if self.ready_prefills:
-                return self._build_batch(self.ready_prefills.popleft())
+                so = self.ready_prefills.popleft()
+                result = self._build_batch(so)
+                logger.info(
+                    "[CLOUD-COORD] _schedule_target: dispatched from ready_prefills "
+                    "tokens=%s bt=%s slices=%d",
+                    so.total_num_scheduled_tokens,
+                    so.batch_type.value if so.batch_type is not None else "None",
+                    len(result.slices),
+                )
+                return result
         elif target_bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
             if self.ready_decodes:
-                return self._build_batch(self.ready_decodes.popleft())
+                so = self.ready_decodes.popleft()
+                result = self._build_batch(so)
+                logger.info(
+                    "[CLOUD-COORD] _schedule_target: dispatched from ready_decodes "
+                    "tokens=%s bt=%s slices=%d",
+                    so.total_num_scheduled_tokens,
+                    so.batch_type.value if so.batch_type is not None else "None",
+                    len(result.slices),
+                )
+                return result
         elif target_bt == BatchType.PD_MIX:
             if self.ready_pdmixes:
-                return self._build_batch(self.ready_pdmixes.popleft())
+                so = self.ready_pdmixes.popleft()
+                result = self._build_batch(so)
+                logger.info(
+                    "[CLOUD-COORD] _schedule_target: dispatched from ready_pdmixes "
+                    "tokens=%s bt=%s",
+                    so.total_num_scheduled_tokens,
+                    so.batch_type.value if so.batch_type is not None else "None",
+                )
+                return result
 
         # Queue empty: nothing to dispatch for this target.
         return ScheduledBatch.empty()
@@ -772,10 +842,25 @@ class PassiveScheduler:
         """
         import torch
         my_cat = self._bt_to_coord_category(intended_bt)
+        _dp_rank = getattr(
+            getattr(self.vllm_config, "parallel_config", None),
+            "data_parallel_rank", "?",
+        )
+        logger.info(
+            "[CLOUD-COORD] _coordinate_bt: dp_rank=%s intended=%s my_cat=%d",
+            _dp_rank,
+            intended_bt.value if intended_bt is not None else "None",
+            my_cat,
+        )
         tensor = torch.tensor([my_cat], dtype=torch.int32)
         import torch.distributed as dist
         dist.all_reduce(tensor, group=self.dp_coord_group, op=dist.ReduceOp.MIN)
         winner_cat = tensor.item()
+        logger.info(
+            "[CLOUD-COORD] _coordinate_bt result: dp_rank=%s winner_cat=%d",
+            _dp_rank,
+            winner_cat,
+        )
         # MIN on categories where 0=EMPTY < 1=prefill < 2=decode < 3=pdmix
         # gives the lowest non-zero category across DPs → first-category
         # wins.  If all are 0, result is 0 → None.
