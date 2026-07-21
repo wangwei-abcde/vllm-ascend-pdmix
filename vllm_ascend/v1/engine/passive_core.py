@@ -455,6 +455,7 @@ class PassiveEngineCoreProc:
         scheduler_input,
         dispatch_policy=None,
         pp_pd_channel: Optional["PPSchedulerZmqChannel"] = None,
+        dp_coord_group=None,  # stateless ProcessGroup for cloud cross-DP coordination
     ) -> None:
         passive_scheduler_module = _import_passive_scheduler_module()
         if dispatch_policy is None:
@@ -471,6 +472,11 @@ class PassiveEngineCoreProc:
         # Optional POST_OUT (cloud → edge) channel. Only set on the cloud
         # side in PD-separation mode; left None for the legacy PP path.
         self._pp_pd_channel = pp_pd_channel
+        # Stateless ProcessGroup for cloud-side cross-DP batch_type
+        # coordination (dp>1 + MoE + PD-separation). When set, the step()
+        # loop coordinates with the peer cloud DP before dispatching to
+        # keep the cloud-side EP all-toall 1:1 paired.
+        self.dp_coord_group = dp_coord_group
         if getattr(vllm_config.parallel_config, "enable_edge_cloud", False):
             # PassiveEngineCore runs in a freshly-spawned subprocess; the
             # ``_ASCEND_CONFIG`` singleton may be empty here. ``init_ascend_config``
@@ -532,11 +538,101 @@ class PassiveEngineCoreProc:
                 )
                 self._maybe_publish_post_out(scheduler_output)
 
+    # ------------------------------------------------------------------ #
+    # Cross-DP coordination (cloud side, MoE DP>1)                        #
+    # ------------------------------------------------------------------ #
+
+    def _is_coordinated_dp(self) -> bool:
+        """True when cloud-side cross-DP batch_type coordination is active:
+        dp>1 (dp_coord_group is set) + PD-separation channel + MoE.
+
+        Mirrors the edge-side ``_is_coordinated_dp`` in
+        ``patch_engine_core.py``.
+        """
+        return (
+            self.dp_coord_group is not None
+            and self._pp_pd_channel is not None
+            and bool(getattr(self.vllm_config.model_config, "is_moe", False))
+        )
+
+    def _coordinate_bt(
+        self, intended_bt: BatchType | None
+    ) -> BatchType | None:
+        """All-reduce intended batch_type category across cloud DPs.
+
+        Uses ``self.dp_coord_group`` (stateless ProcessGroup).  Rule:
+        lowest-dp-rank DP with real (non-EMPTY) intent wins (dp0 priority).
+        Returns the winner batch_type, or None if all DPs are idle.
+
+        Category mapping (cloud-side):
+            0 = EMPTY / nothing to dispatch
+            1 = prefill-like (PURE_PREFILL, PREFILL_FIRST)
+            2 = decode-like (PURE_DECODE, DECODE_FIRST)
+            3 = pdmix
+        """
+        import torch
+        dp_group = self.dp_coord_group
+        if dp_group is None:
+            # Safety guard: should never happen (_is_coordinated_dp
+            # gates the call), but a missing group is not a hang risk
+            # when detected early.
+            logger.warning(
+                "[CLOUD-COORD] dp_coord_group is None despite "
+                "_is_coordinated_dp=True — returning None"
+            )
+            return None
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+
+        # Each rank fills its own slot; SUM gathers every rank's value.
+        tensor = torch.zeros(dp_size, dtype=torch.int32, device="cpu")
+        my_cat = 0
+        if intended_bt is not None:
+            if intended_bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
+                my_cat = 1
+            elif intended_bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
+                my_cat = 2
+            elif intended_bt == BatchType.PD_MIX:
+                my_cat = 3
+        tensor[dp_rank] = my_cat
+        torch.distributed.all_reduce(tensor, group=dp_group)
+
+        # Find the first non-zero entry (lowest dp_rank with real work)
+        winner_cat = 0
+        for r in range(dp_size):
+            cat = int(tensor[r].item())
+            if cat != 0:
+                winner_cat = cat
+                break
+
+        _cnt = getattr(self, "_cloud_coord_count", 0) + 1
+        self._cloud_coord_count = _cnt
+        if _cnt % 32 == 0 or winner_cat != 0:
+            logger.info(
+                "[CLOUD-COORD] dp_rank=%s count=%s intended=%s winner=%s",
+                dp_rank, _cnt, my_cat, winner_cat,
+            )
+
+        if winner_cat == 0:
+            return None
+        if winner_cat == 1:
+            return BatchType.PREFILL_FIRST
+        if winner_cat == 2:
+            return BatchType.DECODE_FIRST
+        if winner_cat == 3:
+            return BatchType.PD_MIX
+        return None
+
     def step(self) -> bool:
         """Single tick: poll ZMQ → pick batches → enqueue worker payloads.
 
         Batches are dispatched one phase at a time in the order encoded by
         the configured dispatch policy.
+
+        When cross-DP coordination is active (``dp_coord_group`` is set),
+        coordinates with the peer cloud DP before dispatching: both sides
+        agree on the same batch_type so the cloud-side EP all-toall always
+        pairs on the same layer.
 
         Returns:
             True if at least one payload was enqueued, False if the
@@ -544,7 +640,29 @@ class PassiveEngineCoreProc:
         """
         self._drain_worker_completion_acks()
         self.passive_scheduler.poll_and_classify()
-        batch = self.passive_scheduler.schedule()
+
+        # --- Cross-DP batch_type coordination (MoE DP>1) ---
+        # DP0's EEP/EED state machine makes the natural decision (prefill
+        # or decode).  Both cloud DPs exchange their intended batch_type
+        # and agree on DP0's result as the winner.  Each DP then calls
+        # schedule(target_batch_type=winner):
+        #   - DP0: intended == winner → normal EEP/EED path (state
+        #     machine transitions, layer slicing, throttle)
+        #   - DP1: if intended == winner → normal path; otherwise
+        #     _force_schedule_target produces a dummy (tokens=0) so
+        #     both cloud workers participate in EP all-toall.
+        _coordinated = self._is_coordinated_dp()
+        if _coordinated:
+            _intended_bt = self.passive_scheduler._intended_batch_type()
+            _coord_winner = self._coordinate_bt(_intended_bt)
+            if _coord_winner is None:
+                return False
+            batch = self.passive_scheduler.schedule(
+                target_batch_type=_coord_winner
+            )
+        else:
+            batch = self.passive_scheduler.schedule()
+
         if batch.is_empty():
             return False
 
@@ -806,10 +924,59 @@ class PassiveEngineCoreProc:
 
             if scheduler_input is not None:
                 executor.start_worker_monitor(inline=False)
+
+                # --- Cross-DP coordination group (cloud side) ---
+                # When dp>1 + MoE + PD-separation, create a stateless
+                # ProcessGroup so both cloud DPs can coordinate before
+                # dispatching (exchange intended bt → agree on winner →
+                # force-schedule).  This keeps the cloud-side EP
+                # all-toall paired on the same layer.
+                # Uses a dedicated port (master_port + 200) to avoid
+                # conflicting with the edge's dp_group (master_port).
+                dp_coord_group = None
+                _dp_size = getattr(
+                    vllm_config.parallel_config, "data_parallel_size", 1
+                )
+                _is_moe = bool(getattr(
+                    vllm_config.model_config, "is_moe", False
+                ))
+                if _dp_size > 1 and _pd_enabled and _is_moe:
+                    from vllm.distributed.utils import (
+                        stateless_init_torch_distributed_process_group,
+                    )
+                    _coord_port = (
+                        vllm_config.parallel_config.master_port + 200
+                    )
+                    _dp_rank = getattr(
+                        vllm_config.parallel_config,
+                        "data_parallel_rank", 0,
+                    )
+                    _master_ip = getattr(
+                        vllm_config.parallel_config,
+                        "data_parallel_master_ip",
+                        vllm_config.parallel_config.master_addr,
+                    )
+                    dp_coord_group = (
+                        stateless_init_torch_distributed_process_group(
+                            host=_master_ip,
+                            port=_coord_port,
+                            rank=_dp_rank,
+                            world_size=_dp_size,
+                            backend="gloo",
+                        )
+                    )
+                    logger.info(
+                        "Cloud cross-DP coord group created: "
+                        "dp_rank=%s/%s port=%s",
+                        _dp_rank, _dp_size, _coord_port,
+                    )
+                # -------------------------------------------------------
+
                 proc = PassiveEngineCoreProc(
                     vllm_config, executor, scheduler_input,
                     dispatch_policy=policy,
                     pp_pd_channel=pp_pd_channel,
+                    dp_coord_group=dp_coord_group,
                 )
                 proc.run_busy_loop()
             else:
