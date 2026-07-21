@@ -638,11 +638,6 @@ class PassiveEngineCoreProc:
             True if at least one payload was enqueued, False if the
             scheduler had nothing to dispatch.
         """
-        _dp_rank = getattr(
-            self.vllm_config.parallel_config, "data_parallel_rank", "?")
-        _step_cnt = getattr(self, "_cloud_step_count", 0) + 1
-        self._cloud_step_count = _step_cnt
-
         self._drain_worker_completion_acks()
         self.passive_scheduler.poll_and_classify()
 
@@ -668,17 +663,6 @@ class PassiveEngineCoreProc:
         if _coordinated:
             _intended_bt = self.passive_scheduler._intended_batch_type()
             _coord_winner = self._coordinate_bt(_intended_bt)
-            logger.info("[CLOUD-STEP] %s coord DONE: dp_rank=%s "
-                        "intended=%s winner=%s "
-                        "rp=%d rd=%d rpd=%d as=%d",
-                        _step_cnt, _dp_rank,
-                        _intended_bt.value if _intended_bt is not None else "None",
-                        _coord_winner.value if _coord_winner is not None else "None",
-                        len(self.passive_scheduler.ready_prefills),
-                        len(self.passive_scheduler.ready_decodes),
-                        len(self.passive_scheduler.ready_pdmixes),
-                        len(self.passive_scheduler._active_prefill_slices),
-                        )
             if _coord_winner is None:
                 # Both DPs idle — dispatch a dummy decode on both sides
                 # unconditionally (force_dummy avoids touching ready
@@ -697,33 +681,6 @@ class PassiveEngineCoreProc:
         if batch.is_empty():
             return False
 
-        _disp_so = batch.scheduler_output
-        if _disp_so.total_num_scheduled_tokens == 0:
-            logger.error(
-                "[HANG] cloud step dispatch dummy: dp_rank=%s head_token=%s",
-                getattr(self.vllm_config.parallel_config, "data_parallel_rank", "?"),
-                getattr(_disp_so, "head_token", "?"),
-            )
-
-        _slice_info_str = "["
-        for s in batch.slices:
-            if s is not None:
-                _slice_info_str += (
-                    f"slice_index={s.slice_index},"
-                    f"start={s.start_layer},"
-                    f"end={s.end_layer},"
-                    f"is_last={s.is_last_slice};"
-                )
-            else:
-                _slice_info_str += "None;"
-        _slice_info_str += "]"
-        logger.info(
-            f"\r\n[Cloud] Step dispatched batch_type: "
-            f"{batch.scheduler_output.batch_type}, "
-            f"slices_count={len(batch.slices)}, "
-            f"slice_info={_slice_info_str}",
-        )
-
         for slice_info in batch.slices:
             worker_scheduler_output = _trim_scheduler_output_for_worker_enqueue(
                 batch.scheduler_output,
@@ -734,20 +691,11 @@ class PassiveEngineCoreProc:
                 if slice_info is not None
                 else (worker_scheduler_output,)
             )
-            bt = batch.scheduler_output.batch_type.value
-            logger.info("[CLOUD-MQ] About to enqueue batch_type=%s", bt)
-            _t0 = time.monotonic()
             self.executor.rpc_broadcast_mq.enqueue(
                 (b"pp_scheduler_output", payload, {}, None)
             )
             self._prev_dispatch_req_ids = set(
                 batch.scheduler_output.num_scheduled_tokens.keys()
-            )
-            _dt_ms = (time.monotonic() - _t0) * 1000
-            logger.info(
-                "[CLOUD-ENQUEUE] %s enqueue took %.3f ms",
-                bt,
-                _dt_ms,
             )
             # For PREFILL_FIRST, POST_OUT must mean the cloud middle segment
             # has completed and started sending hidden states back.  Store the
