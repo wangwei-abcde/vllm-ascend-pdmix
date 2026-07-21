@@ -747,6 +747,7 @@ class NPUWorker(WorkerBase):
             self.model_runner._dummy_run(
                 num_tokens=self.model_runner.decode_token_per_req,
                 uniform_decode=False,
+                layer_slice_info=layer_slice_info,
             )
             return None
         logger.info(

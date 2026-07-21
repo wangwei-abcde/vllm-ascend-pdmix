@@ -218,6 +218,8 @@ def _maybe_publish_pre_out(
         return
     bt = scheduler_output.batch_type
     if bt == BatchType.DECODE_FIRST:
+        # Record batch_type for peer DP's dummy ZMQ type matching.
+        self._last_published_batch_type_value = bt.value
         self._pp_pd_channel.publish(scheduler_output)
     elif bt in (
         BatchType.EMPTY,
@@ -266,6 +268,8 @@ def _publish_pre_out_when_ready(self) -> None:
         return
 
     ch.publish(oldest_so)
+    # Record batch_type for peer DP's dummy ZMQ type matching.
+    self._last_published_batch_type_value = BatchType.PREFILL_FIRST.value
     published.add(head_token)
     logger.info(
         "[PRE_OUT] Published PREFILL_FIRST (head_token=%s) when it became next to execute, "
@@ -423,6 +427,27 @@ def _patched_step(self):
     )
 
 
+def _sync_peer_batch_type(self) -> None:
+    """Broadcast dp0's current batch_type to all peer DPs.
+
+    Called from both scheduling paths (dp0 and dp1) AFTER dp0 has
+    decided its current batch_type so the broadcast always carries the
+    most up-to-date value — no stale data from a previous iteration.
+    """
+    _dp_size = getattr(self.vllm_config.parallel_config, 'data_parallel_size', 1)
+    if _dp_size < 2 or getattr(self, '_pp_pd_channel', None) is None:
+        return
+    import torch
+    import torch.distributed as dist
+    _bt_tensor = torch.zeros(1, dtype=torch.int64)
+    _dp_rank = getattr(self.vllm_config.parallel_config, 'data_parallel_rank', 0)
+    if _dp_rank == 0:
+        _val = getattr(self, '_last_published_batch_type_value', 0)
+        _bt_tensor[0] = _val
+    dist.broadcast(_bt_tensor, src=0)
+    self._peer_real_batch_type_value = _bt_tensor.item()
+
+
 # =======================================================================#
 # EngineCore.step_with_batch_queue — full replacement.                    #
 # =======================================================================#
@@ -443,6 +468,16 @@ def _patched_step_with_batch_queue(self):
 
         scheduler_output = self.scheduler.schedule()
         self._hang_last_bt = str(scheduler_output.batch_type)
+
+        # Immediately record the batch_type that dp0 will execute THIS
+        # iteration so the peer DP's broadcast (below) sees the current
+        # value, not a stale one from a previous phase.
+        _sched_bt = scheduler_output.batch_type
+        if _sched_bt in (BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST):
+            self._last_published_batch_type_value = _sched_bt.value
+        # Synchronise with dummy DP: dp0 broadcasts its current
+        # batch_type so dp1 can mirror it in its dummy ZMQ.
+        _sync_peer_batch_type(self)
 
         # [ascend insert] Assign head-token for edge-cloud head-segment
         # batches so the tail-segment can be matched to the suspended
@@ -535,6 +570,9 @@ def _patched_step_with_batch_queue(self):
                     return None, True
 
     elif not batch_queue:
+        # Synchronise with real DP: dp1 reads dp0's current batch_type
+        # so its dummy ZMQ mirrors the real DP's phase (prefill/decode).
+        _sync_peer_batch_type(self)
         return None, False
 
     # Block until the next result is available.
@@ -742,9 +780,24 @@ def _patched_execute_dummy_batch(self):
             HiddenChannelType as _HiddenChannelType,
             SchedulerOutput as _SchedulerOutput,
         )
+        # Mirror dp0's last published batch_type so the cloud-side
+        # PassiveScheduler classifies dummy and real into the same
+        # queue (ready_prefills vs ready_decodes), making slice counts
+        # symmetric across DPs.
+        _peer_bt = getattr(self, '_peer_real_batch_type_value', None)
+        _bt_map = {
+            _BatchType.PREFILL_FIRST.value: (_BatchType.PREFILL_FIRST, _HiddenChannelType.PREFILL),
+            _BatchType.DECODE_FIRST.value:  (_BatchType.DECODE_FIRST,  _HiddenChannelType.DECODE),
+        }
+        if _peer_bt is not None and _peer_bt in _bt_map:
+            dummy_bt, dummy_hc = _bt_map[_peer_bt]
+        else:
+            # Fallback when no real batch_type known yet (e.g. first
+            # iterations before dp0 publishes anything).
+            dummy_bt, dummy_hc = _BatchType.DECODE_FIRST, _HiddenChannelType.DECODE
         dummy_so = _SchedulerOutput.make_empty()
-        dummy_so.batch_type = _BatchType.DECODE_FIRST
-        dummy_so.hidden_channel = _HiddenChannelType.DECODE
+        dummy_so.batch_type = dummy_bt
+        dummy_so.hidden_channel = dummy_hc
         dummy_so.head_token = uuid4().hex
         # Dynamic marker consumed by cloud _execute_model_cloud / PassiveEngineCore.step.
         setattr(dummy_so, "is_pd_dummy", True)
@@ -769,9 +822,19 @@ def _publish_pd_dummy_zmq(self):
         HiddenChannelType as _HiddenChannelType,
         SchedulerOutput as _SchedulerOutput,
     )
+    # Mirror dp0's last published batch_type for dummy ZMQ.
+    _peer_bt = getattr(self, '_peer_real_batch_type_value', None)
+    _bt_map = {
+        _BatchType.PREFILL_FIRST.value: (_BatchType.PREFILL_FIRST, _HiddenChannelType.PREFILL),
+        _BatchType.DECODE_FIRST.value:  (_BatchType.DECODE_FIRST,  _HiddenChannelType.DECODE),
+    }
+    if _peer_bt is not None and _peer_bt in _bt_map:
+        dummy_bt, dummy_hc = _bt_map[_peer_bt]
+    else:
+        dummy_bt, dummy_hc = _BatchType.DECODE_FIRST, _HiddenChannelType.DECODE
     dummy_so = _SchedulerOutput.make_empty()
-    dummy_so.batch_type = _BatchType.DECODE_FIRST
-    dummy_so.hidden_channel = _HiddenChannelType.DECODE
+    dummy_so.batch_type = dummy_bt
+    dummy_so.hidden_channel = dummy_hc
     dummy_so.head_token = uuid4().hex
     setattr(dummy_so, "is_pd_dummy", True)
     ch.publish(dummy_so)

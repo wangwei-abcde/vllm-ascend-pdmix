@@ -507,6 +507,22 @@ class PassiveScheduler:
         total_slices = self._resolve_slice_count(
             so.total_num_scheduled_tokens
         )
+        # Dummy prefill (total_num_scheduled_tokens == 0) needs the same
+        # slice count as the real prefill so both DPs run identical layer
+        # ranges and cross-DP all_reduce stays paired.  When the token
+        # count is zero, _resolve_slice_count returns 0 (no threshold
+        # matched); fall back to the finest-granularity entry in the
+        # YAML config (smallest token threshold -> largest slice count).
+        if total_slices == 0 and so.total_num_scheduled_tokens == 0:
+            if (
+                self._layer_slice_config is not None
+                and len(self._layer_slice_config) > 0
+            ):
+                # _layer_slice_config is sorted descending by token
+                # threshold (e.g. 16, 8, 4, 1, 0).  The last entry has
+                # the smallest threshold and thus the largest slice
+                # count — the most conservative (finest) split.
+                _, total_slices = list(self._layer_slice_config.items())[-1]
         # Slicing disabled or trivially 1 slice.
         if total_slices <= 1:
             return [None]
