@@ -962,10 +962,6 @@ class PassiveEngineCoreProc:
                     _coord_port = (
                         vllm_config.parallel_config.master_port + 200
                     )
-                    _dp_rank = getattr(
-                        vllm_config.parallel_config,
-                        "data_parallel_rank", 0,
-                    )
                     # Both cloud PassiveEngineCore processes are colocated
                     # on the same cloud machine — use localhost for the
                     # TCP rendezvous.  master_addr / data_parallel_master_ip
