@@ -664,13 +664,13 @@ class PassiveEngineCoreProc:
             _intended_bt = self.passive_scheduler._intended_batch_type()
             _coord_winner = self._coordinate_bt(_intended_bt)
             if _coord_winner is None:
-                # Both DPs idle — dispatch a dummy decode on both sides
-                # unconditionally (force_dummy avoids touching ready
-                # queues which may be non-empty on one side only).
-                batch = self.passive_scheduler.schedule(
-                    target_batch_type=BatchType.DECODE_FIRST,
-                    force_dummy=True,
-                )
+                # Both DPs idle — nothing to dispatch, skip this
+                # tick.  Without real edge PP data there is no EP
+                # all-toall to pair.  Dispatching a dummy here
+                # would make cloud workers run _dummy_run every
+                # tick while the edge is not driving, adding noise
+                # to the busy-loop.
+                return False
             else:
                 batch = self.passive_scheduler.schedule(
                     target_batch_type=_coord_winner
