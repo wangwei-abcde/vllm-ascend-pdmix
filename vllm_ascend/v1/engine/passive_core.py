@@ -653,24 +653,23 @@ class PassiveEngineCoreProc:
         #     all-toall.
         #
         # IMPORTANT: when both DPs have intended=None (e.g. EED +
-        # throttle not expired), the all-reduce still runs (keeps
-        # iterations paired) but winner is None.  We MUST NOT return
-        # False here because the edge-side HCCL PP send is already
-        # in-flight — the cloud worker must execute a dummy forward so
-        # the HCCL PP recv matches the edge's send, otherwise the edge
-        # deadlocks.  Fall back to a DECODE_FIRST dummy (decode is
-        # cheap, never sliced) so both sides dispatch & the HCCL channel
-        # stays drained.
+        # throttle not expired), all-reduce gives winner=None.  Both
+        # sides MUST dispatch the same kind of batch so EP all-toall
+        # pairs (same number of tokens → same number of a2a calls).
+        # We fall back to a force_dummy DECODE_FIRST so neither side
+        # touches its ready queues (one side might have a real decode
+        # while the other has nothing → mismatch).
         _coordinated = self._is_coordinated_dp()
         if _coordinated:
             _intended_bt = self.passive_scheduler._intended_batch_type()
             _coord_winner = self._coordinate_bt(_intended_bt)
             if _coord_winner is None:
-                # Both DPs idle — dispatch a dummy decode to keep HCCL
-                # PP communication paired (edge workers have already
-                # issued HCCL sends that need matching recvs).
+                # Both DPs idle — dispatch a dummy decode on both sides
+                # unconditionally (force_dummy avoids touching ready
+                # queues which may be non-empty on one side only).
                 batch = self.passive_scheduler.schedule(
-                    target_batch_type=BatchType.DECODE_FIRST
+                    target_batch_type=BatchType.DECODE_FIRST,
+                    force_dummy=True,
                 )
             else:
                 batch = self.passive_scheduler.schedule(
