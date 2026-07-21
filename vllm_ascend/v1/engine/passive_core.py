@@ -646,20 +646,36 @@ class PassiveEngineCoreProc:
         # or decode).  Both cloud DPs exchange their intended batch_type
         # and agree on DP0's result as the winner.  Each DP then calls
         # schedule(target_batch_type=winner):
-        #   - DP0: intended == winner → normal EEP/EED path (state
-        #     machine transitions, layer slicing, throttle)
-        #   - DP1: if intended == winner → normal path; otherwise
-        #     _force_schedule_target produces a dummy (tokens=0) so
-        #     both cloud workers participate in EP all-toall.
+        #   - If intended == winner → normal EEP/EED path (state machine
+        #     transitions, layer slicing, throttle)
+        #   - If intended != winner → _force_schedule_target produces a
+        #     dummy (tokens=0) so both cloud workers participate in EP
+        #     all-toall.
+        #
+        # IMPORTANT: when both DPs have intended=None (e.g. EED +
+        # throttle not expired), the all-reduce still runs (keeps
+        # iterations paired) but winner is None.  We MUST NOT return
+        # False here because the edge-side HCCL PP send is already
+        # in-flight — the cloud worker must execute a dummy forward so
+        # the HCCL PP recv matches the edge's send, otherwise the edge
+        # deadlocks.  Fall back to a DECODE_FIRST dummy (decode is
+        # cheap, never sliced) so both sides dispatch & the HCCL channel
+        # stays drained.
         _coordinated = self._is_coordinated_dp()
         if _coordinated:
             _intended_bt = self.passive_scheduler._intended_batch_type()
             _coord_winner = self._coordinate_bt(_intended_bt)
             if _coord_winner is None:
-                return False
-            batch = self.passive_scheduler.schedule(
-                target_batch_type=_coord_winner
-            )
+                # Both DPs idle — dispatch a dummy decode to keep HCCL
+                # PP communication paired (edge workers have already
+                # issued HCCL sends that need matching recvs).
+                batch = self.passive_scheduler.schedule(
+                    target_batch_type=BatchType.DECODE_FIRST
+                )
+            else:
+                batch = self.passive_scheduler.schedule(
+                    target_batch_type=_coord_winner
+                )
         else:
             batch = self.passive_scheduler.schedule()
 
