@@ -999,7 +999,19 @@ class PassiveScheduler:
                          group=self.dp_coord_group)
 
         data = bytes(buf_tensor.tolist()).rstrip(b'\x00')
-        return pickle.loads(data)
+        winner_decision: SchedulerDecision = pickle.loads(data)
+
+        # Non-winner DPs must NOT inherit the winner's stateful fields
+        # (is_continuation, new_state, throttle_action) — those belong
+        # to the winner's own state machine and continuation cycle.
+        # Keep only batch_type and dispatch_queue so the non-winner can
+        # correctly classify its dummy payload.
+        if _dp_rank != winner_rank:
+            return SchedulerDecision(
+                batch_type=winner_decision.batch_type,
+                dispatch_queue=winner_decision.dispatch_queue,
+            )
+        return winner_decision
 
     def _apply_decision_alternation(
         self, decision: SchedulerDecision
