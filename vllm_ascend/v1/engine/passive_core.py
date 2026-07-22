@@ -605,14 +605,6 @@ class PassiveEngineCoreProc:
                 winner_cat = cat
                 break
 
-        _cnt = getattr(self, "_cloud_coord_count", 0) + 1
-        self._cloud_coord_count = _cnt
-        if _cnt % 32 == 0 or winner_cat != 0:
-            logger.info(
-                "[CLOUD-COORD] dp_rank=%s count=%s intended=%s winner=%s",
-                dp_rank, _cnt, my_cat, winner_cat,
-            )
-
         if winner_cat == 0:
             return None
         if winner_cat == 1:
