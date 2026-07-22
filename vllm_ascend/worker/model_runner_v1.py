@@ -4532,6 +4532,16 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = self._layerwise_num_tokens_across_dp
         batch_desc = self._layerwise_batch_desc
 
+        # Non-first slices must participate in the cross-DP all_reduce
+        # so that the peer DP's _dummy_run (which always calls
+        # _sync_metadata_across_dp) does not deadlock.  The returned
+        # values are discarded — continuation uses the slice-0 cached
+        # results above, which are already correct.
+        self._sync_metadata_across_dp(
+            num_tokens=num_tokens_padded,
+            cudagraph_mode=CUDAGraphMode.NONE,
+        )
+
         has_encoder_input = False
         clear_kv_metadata = self.speculative_config is None
 
