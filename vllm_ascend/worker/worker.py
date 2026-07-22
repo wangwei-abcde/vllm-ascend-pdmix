@@ -893,7 +893,6 @@ class NPUWorker(WorkerBase):
         # 0, not the slot after the cloud.
         if get_pp_group().world_size > 1:
             channel = self._hidden_channel_for(scheduler_output)
-            _hang_ret_rank = getattr(self.model_runner, "dp_rank", "?")
             # PD-separation diagnostic: log hidden_states norm at cloud output
             _hs_c = _gathered.get("hidden_states")
             if _hs_c is not None:
@@ -908,9 +907,6 @@ class NPUWorker(WorkerBase):
                                             dst=0),
                 channel=channel,
             )
-            logger.error("[HANG] cloud return isend EXIT: dp_rank=%s channel=%s",
-                        _hang_ret_rank, channel.value)
-            _hang_sys.stderr.flush()
             logger.info(f"Send intermediate tensors to edge, hidden_channel={channel.value}")
         return output
 
