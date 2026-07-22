@@ -5755,6 +5755,7 @@ class NPUModelRunner(GPUModelRunner):
                     outputs = self._model_forward(
                         num_tokens_padded, input_ids, positions,
                         intermediate_tensors, inputs_embeds,
+                        layer_slice_info=layer_slice_info,
                         **_model_kwargs,
                     )
                 if self.use_aux_hidden_state_outputs:

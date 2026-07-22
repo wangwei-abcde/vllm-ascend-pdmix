@@ -1259,6 +1259,17 @@ class NPUWorker(WorkerBase):
         # overflow -> NaN when the dummy's query (from zero input) interacts
         # with large real KV values. Prefill-style attention is causal (only
         # writes KV, doesn't read), avoiding the NaN.
+        _lsi = layer_slice_info
+        logger.error(
+            "[SLICE-DIAG] execute_dummy_batch entry: layer_slice_info=%s "
+            "is_first=%s is_last=%s start=%s end=%s total=%s",
+            type(_lsi).__name__ if _lsi is not None else "None",
+            getattr(_lsi, "is_first_slice", None) if _lsi is not None else None,
+            getattr(_lsi, "is_last_slice", None) if _lsi is not None else None,
+            getattr(_lsi, "start_layer", None) if _lsi is not None else None,
+            getattr(_lsi, "end_layer", None) if _lsi is not None else None,
+            getattr(_lsi, "total_slices", None) if _lsi is not None else None,
+        )
         self.model_runner._dummy_run(
             num_tokens=self.model_runner.decode_token_per_req,
             uniform_decode=False,

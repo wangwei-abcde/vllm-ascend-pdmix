@@ -771,11 +771,13 @@ class PassiveScheduler:
         Phase 3 – the coordinated decision is applied locally: state
         machine transitions, throttle, and queue popping.
         """
-        self._log_queue_state("pre-decision")
         decision = self._make_decision_alternation()
-        self._log_local_decision(decision, "post-local-decision")
+        if decision.batch_type is not None:
+            self._log_queue_state("post-local-decision")
+            self._log_local_decision(decision, "post-local-decision")
         decision = self._coordinate_decision(decision)
-        self._log_local_decision(decision, "post-coord-decision")
+        if decision.batch_type is not None:
+            self._log_local_decision(decision, "post-coord-decision")
         if decision.batch_type is None:
             return ScheduledBatch.empty()
         return self._apply_decision_alternation(decision)
