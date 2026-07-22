@@ -697,9 +697,19 @@ class PassiveScheduler:
         three-phase flow is used: decide → coordinate → apply.  Otherwise
         the original single-DP logic is used.
         """
-        if self.dp_coord_group is not None:
+        if self.dp_coord_group is not None and self._is_coordinated_dp():
             return self._schedule_expect_alternation_coordinated()
         return self._schedule_expect_alternation_simple()
+
+    def _is_coordinated_dp(self) -> bool:
+        """True when cross-DP coordination should be active on the cloud side:
+        dp_coord_group is set AND model is MoE AND PD-separation is enabled."""
+        return (
+            bool(getattr(self.vllm_config.model_config, "is_moe", False))
+            and getattr(
+                self.vllm_config.parallel_config, "enable_edge_cloud", False
+            )
+        )
 
     def _schedule_expect_alternation_simple(self) -> ScheduledBatch:
         """Original single-DP EEP/EED state machine (no cross-DP coord)."""
@@ -903,8 +913,12 @@ class PassiveScheduler:
         tensor[_dp_rank] = _cat
         dist.all_reduce(tensor, group=self.dp_coord_group)
 
-        # dp0's category wins.
+        # dp0's decision takes priority, but if dp0 is idle, fall
+        # back to dp1's decision so a request bound to dp1 alone is
+        # not starved.
         winner_cat = int(tensor[0].item())
+        if winner_cat == 0:
+            winner_cat = int(tensor[1].item())
         if winner_cat == 0:
             return SchedulerDecision()  # all idle
 
