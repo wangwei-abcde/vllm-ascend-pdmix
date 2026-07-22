@@ -67,6 +67,22 @@ class LayerSliceInfo:
 
 
 @dataclass
+class SchedulerDecision:
+    """Read-only snapshot of what ``schedule()`` *would* do next.
+
+    Produced by :meth:`PassiveScheduler._make_decision` without any side
+    effects.  When cross-DP coordination is active, decisions from all DPs
+    are exchanged via all-reduce and dp0's decision becomes authoritative.
+    """
+    batch_type: BatchType | None = None     # None → idle, nothing to dispatch
+    dispatch_queue: str | None = None       # "ready_prefills" / "ready_decodes" / "ready_pdmixes" / None
+    is_continuation: bool = False           # dispatch from _active_prefill_slices?
+    token_count: int = 0                    # total_num_scheduled_tokens (0 for dummy)
+    new_state: CloudSchedulingState | None = None  # EEP → EED transition hint
+    throttle_action: str | None = None      # "start" / "clear" / None
+
+
+@dataclass
 class ScheduledBatch:
     """Output of `PassiveScheduler.schedule()`: one SchedulerOutput plus the
     layer slices to dispatch in this engine tick.
@@ -121,11 +137,17 @@ class PassiveScheduler:
         pp_subscriber: "PPSchedulerZmqSubscriber",
         dispatch_policy: DispatchPolicy = DispatchPolicy.EXPECT_ALTERNATION,
         run_subscriber_thread: bool = True,
+        dp_coord_group=None,  # stateless ProcessGroup for cross-DP coordination
     ) -> None:
         self.pp_subscriber = pp_subscriber
         self.vllm_config = vllm_config
         self.dispatch_policy = dispatch_policy
         self.cloud_scheduling_state = CloudSchedulingState.EXPECT_EXECUTE_PREFILL
+
+        # Optional cross-DP coordination group. Set by the engine core
+        # when dp>1 + MoE + PD-separation.  schedule() uses it to
+        # coordinate batch_type decisions across cloud DPs.
+        self.dp_coord_group = dp_coord_group
 
         self.ready_prefills: deque[SchedulerOutput] = deque()
         self.ready_pdmixes: deque[SchedulerOutput] = deque()
@@ -664,7 +686,23 @@ class PassiveScheduler:
         self._start_prefill_middle_throttle()
         return self._build_batch(self.ready_prefills.popleft())
 
+    # ------------------------------------------------------------------ #
+    # EXPECT_ALTERNATION: decision / coordination / application           #
+    # ------------------------------------------------------------------ #
+
     def _schedule_expect_alternation(self) -> ScheduledBatch:
+        """Pick the next batch to dispatch under the EEP/EED state machine.
+
+        When cross-DP coordination is active (``dp_coord_group`` is set), the
+        three-phase flow is used: decide → coordinate → apply.  Otherwise
+        the original single-DP logic is used.
+        """
+        if self.dp_coord_group is not None:
+            return self._schedule_expect_alternation_coordinated()
+        return self._schedule_expect_alternation_simple()
+
+    def _schedule_expect_alternation_simple(self) -> ScheduledBatch:
+        """Original single-DP EEP/EED state machine (no cross-DP coord)."""
         state = self.cloud_scheduling_state
         if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
             if self._active_prefill_slices:
@@ -714,6 +752,233 @@ class PassiveScheduler:
                 self._start_prefill_middle_throttle()
             return self._build_batch(self.ready_pdmixes.popleft())
         return ScheduledBatch.empty()
+
+    def _schedule_expect_alternation_coordinated(self) -> ScheduledBatch:
+        """Three-phase dispatch: decide → coordinate → apply.
+
+        Phase 1 – each DP produces a read-only ``SchedulerDecision``.
+        Phase 2 – decisions are exchanged via all-reduce; dp0's wins.
+        Phase 3 – the coordinated decision is applied locally: state
+        machine transitions, throttle, and queue popping.
+        """
+        decision = self._make_decision_alternation()
+        decision = self._coordinate_decision(decision)
+        if decision.batch_type is None:
+            return ScheduledBatch.empty()
+        return self._apply_decision_alternation(decision)
+
+    def _make_decision_alternation(self) -> SchedulerDecision:
+        """Read-only: produce a ``SchedulerDecision`` from the current
+        state machine, throttle, and ready queues.  Zero side effects."""
+        state = self.cloud_scheduling_state
+
+        if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
+            if self._active_prefill_slices:
+                return SchedulerDecision(
+                    batch_type=(
+                        self._active_sliced_prefill.batch_type
+                        if self._active_sliced_prefill else None
+                    ),
+                    is_continuation=True,
+                    token_count=(
+                        self._active_sliced_prefill.total_num_scheduled_tokens
+                        if self._active_sliced_prefill else 0
+                    ),
+                    new_state=CloudSchedulingState.EXPECT_EXECUTE_DECODE,
+                    throttle_action="start",
+                )
+            if self.ready_prefills:
+                _so = self.ready_prefills[0]
+                return SchedulerDecision(
+                    batch_type=_so.batch_type,
+                    dispatch_queue="ready_prefills",
+                    token_count=_so.total_num_scheduled_tokens,
+                    new_state=CloudSchedulingState.EXPECT_EXECUTE_DECODE,
+                    throttle_action="start",
+                )
+            if self.ready_decodes:
+                _so = self.ready_decodes[0]
+                return SchedulerDecision(
+                    batch_type=_so.batch_type,
+                    dispatch_queue="ready_decodes",
+                    token_count=_so.total_num_scheduled_tokens,
+                    throttle_action="clear",
+                )
+        else:  # EXPECT_EXECUTE_DECODE
+            if self.ready_decodes:
+                _so = self.ready_decodes[0]
+                return SchedulerDecision(
+                    batch_type=_so.batch_type,
+                    dispatch_queue="ready_decodes",
+                    token_count=_so.total_num_scheduled_tokens,
+                    new_state=CloudSchedulingState.EXPECT_EXECUTE_PREFILL,
+                    throttle_action="clear",
+                )
+            if self._can_fallback_to_prefill_in_decode_state():
+                if self._active_prefill_slices:
+                    return SchedulerDecision(
+                        batch_type=(
+                            self._active_sliced_prefill.batch_type
+                            if self._active_sliced_prefill else None
+                        ),
+                        is_continuation=True,
+                        token_count=(
+                            self._active_sliced_prefill.total_num_scheduled_tokens
+                            if self._active_sliced_prefill else 0
+                        ),
+                        throttle_action="start",
+                    )
+                if self.ready_prefills:
+                    _so = self.ready_prefills[0]
+                    return SchedulerDecision(
+                        batch_type=_so.batch_type,
+                        dispatch_queue="ready_prefills",
+                        token_count=_so.total_num_scheduled_tokens,
+                        throttle_action="start",
+                    )
+
+        if self.ready_pdmixes:
+            _so = self.ready_pdmixes[0]
+            _blocked = (
+                state == CloudSchedulingState.EXPECT_EXECUTE_DECODE
+                and not self._can_fallback_to_prefill_in_decode_state()
+            )
+            if not _blocked:
+                return SchedulerDecision(
+                    batch_type=_so.batch_type,
+                    dispatch_queue="ready_pdmixes",
+                    token_count=_so.total_num_scheduled_tokens,
+                    throttle_action=(
+                        "start"
+                        if state == CloudSchedulingState.EXPECT_EXECUTE_DECODE
+                        else None
+                    ),
+                )
+
+        return SchedulerDecision()
+
+    def _coordinate_decision(
+        self, decision: SchedulerDecision
+    ) -> SchedulerDecision:
+        """Cross-DP coordination: exchange decisions via all-reduce.
+
+        When ``dp_coord_group`` is set and this is a MoE model with
+        PD-separation, all DPs all-reduce their batch_type category.
+        dp0's decision wins; the other DP receives the winning
+        batch_type but keeps its own dispatch metadata.
+        """
+        if self.dp_coord_group is None:
+            return decision
+
+        # Check whether coordination should be active.
+        _is_moe = bool(getattr(
+            self.vllm_config.model_config, "is_moe", False
+        ))
+        _pd_enabled = getattr(
+            self.vllm_config.parallel_config, "enable_edge_cloud", False
+        )
+        if not _is_moe or not _pd_enabled:
+            return decision
+
+        import torch
+        import torch.distributed as dist
+        _dp_size = getattr(
+            self.vllm_config.parallel_config, "data_parallel_size", 1
+        )
+        _dp_rank = getattr(
+            self.vllm_config.parallel_config, "data_parallel_rank", 0
+        )
+
+        # Map batch_type → coordination category.
+        _bt = decision.batch_type
+        _cat = 0  # EMPTY / idle
+        if _bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
+            _cat = 1
+        elif _bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
+            _cat = 2
+        elif _bt == BatchType.PD_MIX:
+            _cat = 3
+
+        tensor = torch.zeros(_dp_size, dtype=torch.int32, device="cpu")
+        tensor[_dp_rank] = _cat
+        dist.all_reduce(tensor, group=self.dp_coord_group)
+
+        # dp0's category wins.
+        winner_cat = int(tensor[0].item())
+        if winner_cat == 0:
+            return SchedulerDecision()  # all idle
+
+        _winner_bt_map: dict[int, BatchType] = {
+            1: BatchType.PREFILL_FIRST,
+            2: BatchType.DECODE_FIRST,
+            3: BatchType.PD_MIX,
+        }
+        winner_bt = _winner_bt_map[winner_cat]
+
+        # If the winner matches our decision, keep the full decision
+        # (token_count, dispatch_queue, etc.).  Otherwise adopt the
+        # winner's batch_type with empty metadata — the apply phase
+        # will produce a dummy for this DP.
+        if winner_bt == decision.batch_type:
+            return decision
+        return SchedulerDecision(batch_type=winner_bt)
+
+    def _apply_decision_alternation(
+        self, decision: SchedulerDecision
+    ) -> ScheduledBatch:
+        """Apply the coordinated decision: state transitions, throttle,
+        queue popping.
+
+        When the decision matches this DP's natural intent,
+        ``_schedule_by_arrival`` / ``_build_batch`` / continuation is
+        used.  Otherwise a dummy SO with the coordinated batch_type is
+        produced so cross-DP EP all-toall stays paired.
+        """
+        _bt = decision.batch_type
+        _is_prefill = _bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST)
+        _is_decode = _bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST)
+        _is_pdmix = _bt == BatchType.PD_MIX
+
+        # --- state-machine transitions ---
+        if decision.new_state is not None:
+            self.cloud_scheduling_state = decision.new_state
+        if decision.throttle_action == "start":
+            self._start_prefill_middle_throttle()
+        elif decision.throttle_action == "clear":
+            self._clear_prefill_middle_throttle()
+
+        # --- dispatch ---
+        if decision.is_continuation:
+            if self._active_prefill_slices:
+                return self._build_active_prefill_slice_batch()
+            # Continuation expected but not available — create dummy.
+            return self._make_dummy_batch(_bt)
+
+        if _is_prefill:
+            if decision.dispatch_queue == "ready_prefills" and self.ready_prefills:
+                return self._build_batch(self.ready_prefills.popleft())
+            return self._make_dummy_batch(_bt)
+
+        if _is_decode:
+            if decision.dispatch_queue == "ready_decodes" and self.ready_decodes:
+                return self._build_batch(self.ready_decodes.popleft())
+            return self._make_dummy_batch(_bt)
+
+        if _is_pdmix:
+            if decision.dispatch_queue == "ready_pdmixes" and self.ready_pdmixes:
+                return self._build_batch(self.ready_pdmixes.popleft())
+            return self._make_dummy_batch(_bt)
+
+        return ScheduledBatch.empty()
+
+    def _make_dummy_batch(self, batch_type: BatchType) -> ScheduledBatch:
+        """Create a dummy SchedulerOutput (tokens=0, is_pd_dummy=True)
+        with the given batch_type, so this DP participates in cross-DP
+        EP all-toall without real work."""
+        so = SchedulerOutput.make_empty()
+        so.batch_type = batch_type
+        setattr(so, "is_pd_dummy", True)
+        return self._build_batch(so)
 
     def _schedule_from_queue(self, queue_name: str) -> ScheduledBatch:
         if self._active_prefill_slices:

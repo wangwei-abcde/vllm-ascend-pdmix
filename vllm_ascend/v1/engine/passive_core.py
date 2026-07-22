@@ -467,7 +467,9 @@ class PassiveEngineCoreProc:
         # scheduler_input is any object exposing consume_new_outputs(); in
         # PD-separation mode this is the cloud-side PPSchedulerZmqChannel.
         self.passive_scheduler = passive_scheduler_module.PassiveScheduler(
-            vllm_config, scheduler_input, dispatch_policy=dispatch_policy
+            vllm_config, scheduler_input,
+            dispatch_policy=dispatch_policy,
+            dp_coord_group=dp_coord_group,
         )
         # Optional POST_OUT (cloud → edge) channel. Only set on the cloud
         # side in PD-separation mode; left None for the legacy PP path.
@@ -544,10 +546,9 @@ class PassiveEngineCoreProc:
         Batches are dispatched one phase at a time in the order encoded by
         the configured dispatch policy.
 
-        When cross-DP coordination is active (``dp_coord_group`` is set),
-        coordinates with the peer cloud DP before dispatching: both sides
-        agree on the same batch_type so the cloud-side EP all-toall always
-        pairs on the same layer.
+        Cross-DP coordination (when dp>1 + MoE + PD-separation) is handled
+        internally by :meth:`PassiveScheduler.schedule` via
+        :meth:`~PassiveScheduler._coordinate_decision`.
 
         Returns:
             True if at least one payload was enqueued, False if the
