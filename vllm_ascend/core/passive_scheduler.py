@@ -771,11 +771,58 @@ class PassiveScheduler:
         Phase 3 – the coordinated decision is applied locally: state
         machine transitions, throttle, and queue popping.
         """
+        self._log_queue_state("pre-decision")
         decision = self._make_decision_alternation()
+        self._log_local_decision(decision, "post-local-decision")
         decision = self._coordinate_decision(decision)
+        self._log_local_decision(decision, "post-coord-decision")
         if decision.batch_type is None:
             return ScheduledBatch.empty()
         return self._apply_decision_alternation(decision)
+
+    def _log_queue_state(self, tag: str) -> None:
+        """Log queue lengths and per-item metadata for debugging."""
+        _dp_rank = getattr(
+            self.vllm_config.parallel_config, "data_parallel_rank", 0
+        )
+        # Per-item summaries.
+        def _pf_str(so):
+            return f"bt={so.batch_type.value if so.batch_type else '?'} tok={so.total_num_scheduled_tokens}"
+        def _si_str(task):
+            si = task.slice_info
+            return f"st={si.start_layer},ed={si.end_layer}" if si else "None"
+        pf_items = [_pf_str(so) for so in self.ready_prefills]
+        dec_items = [_pf_str(so) for so in self.ready_decodes]
+        pdmix_items = [_pf_str(so) for so in self.ready_pdmixes]
+        as_items = [_si_str(t) for t in self._active_prefill_slices]
+        logger.error(
+            "[COORD-DIAG] DP%s %s state=%s "
+            "pf[%d]=[%s] dec[%d]=[%s] pdmix[%d]=[%s] "
+            "active_slices[%d]=[%s]",
+            _dp_rank, tag, self.cloud_scheduling_state.name,
+            len(self.ready_prefills), ", ".join(pf_items),
+            len(self.ready_decodes), ", ".join(dec_items),
+            len(self.ready_pdmixes), ", ".join(pdmix_items),
+            len(self._active_prefill_slices), ", ".join(as_items),
+        )
+
+    def _log_local_decision(
+        self, decision: SchedulerDecision, tag: str
+    ) -> None:
+        _dp_rank = getattr(
+            self.vllm_config.parallel_config, "data_parallel_rank", 0
+        )
+        logger.error(
+            "[COORD-DIAG] DP%s %s bt=%s cont=%s tok=%s "
+            "new_state=%s throttle=%s queue=%s",
+            _dp_rank, tag,
+            decision.batch_type.value if decision.batch_type else "EMPTY",
+            decision.is_continuation,
+            decision.token_count,
+            decision.new_state.name if decision.new_state else "-",
+            decision.throttle_action or "-",
+            decision.dispatch_queue or "-",
+        )
 
     def _make_decision_alternation(self) -> SchedulerDecision:
         """Read-only: produce a ``SchedulerDecision`` from the current
