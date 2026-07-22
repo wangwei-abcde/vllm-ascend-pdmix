@@ -1035,11 +1035,14 @@ class PassiveScheduler:
     def _make_dummy_batch(self, batch_type: BatchType) -> ScheduledBatch:
         """Create a dummy SchedulerOutput (tokens=0, is_pd_dummy=True)
         with the given batch_type, so this DP participates in cross-DP
-        EP all-toall without real work."""
+        EP all-toall without real work.
+
+        Returns a ScheduledBatch directly (bypasses _build_batch) to
+        avoid populating _active_prefill_slices with dummy slices."""
         so = SchedulerOutput.make_empty()
         so.batch_type = batch_type
         setattr(so, "is_pd_dummy", True)
-        return self._build_batch(so)
+        return ScheduledBatch(scheduler_output=so, slices=[None])
 
     def _schedule_from_queue(self, queue_name: str) -> ScheduledBatch:
         if self._active_prefill_slices:
