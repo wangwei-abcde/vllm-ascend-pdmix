@@ -1252,14 +1252,18 @@ class NPUWorker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
-    def execute_dummy_batch(self) -> None:
+    def execute_dummy_batch(self, layer_slice_info: Any = None) -> None:
         # PD-separation: use uniform_decode=False (prefill-style attention)
         # instead of True (decode-style). Decode attention reads from the KV
         # cache which has real data from previous forwards, causing softmax
         # overflow -> NaN when the dummy's query (from zero input) interacts
         # with large real KV values. Prefill-style attention is causal (only
         # writes KV, doesn't read), avoiding the NaN.
-        self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=False)
+        self.model_runner._dummy_run(
+            num_tokens=self.model_runner.decode_token_per_req,
+            uniform_decode=False,
+            layer_slice_info=layer_slice_info,
+        )
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
