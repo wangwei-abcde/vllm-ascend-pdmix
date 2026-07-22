@@ -5381,6 +5381,22 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
+
+        # [SLICE-DIAG] Log whether _dummy_run receives layer_slice_info.
+        _lsi = layer_slice_info
+        logger.error(
+            "[SLICE-DIAG] _dummy_run: layer_slice_info=%s "
+            "is_first=%s is_last=%s start=%s end=%s total=%s "
+            "num_tokens=%s uniform_decode=%s",
+            type(_lsi).__name__ if _lsi is not None else "None",
+            getattr(_lsi, "is_first_slice", None) if _lsi is not None else None,
+            getattr(_lsi, "is_last_slice", None) if _lsi is not None else None,
+            getattr(_lsi, "start_layer", None) if _lsi is not None else None,
+            getattr(_lsi, "end_layer", None) if _lsi is not None else None,
+            getattr(_lsi, "total_slices", None) if _lsi is not None else None,
+            num_tokens,
+            uniform_decode,
+        )
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
         # different graphs and/or modes for mixed prefill-decode batches vs.

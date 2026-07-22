@@ -567,6 +567,23 @@ class PassiveEngineCoreProc:
                 batch.scheduler_output,
                 self._prev_dispatch_req_ids,
             )
+
+            # [SLICE-DIAG] Log cloud enqueue with slice info.
+            _tokens = batch.scheduler_output.total_num_scheduled_tokens
+            _si = slice_info
+            logger.error(
+                "[SLICE-DIAG] cloud step enqueue: tokens=%s slices=%s "
+                "slice_info=%s is_first=%s is_last=%s start=%s end=%s total=%s",
+                _tokens,
+                len(batch.slices),
+                type(_si).__name__ if _si is not None else "None",
+                getattr(_si, "is_first_slice", None) if _si is not None else None,
+                getattr(_si, "is_last_slice", None) if _si is not None else None,
+                getattr(_si, "start_layer", None) if _si is not None else None,
+                getattr(_si, "end_layer", None) if _si is not None else None,
+                getattr(_si, "total_slices", None) if _si is not None else None,
+            )
+
             payload = (
                 (worker_scheduler_output, slice_info)
                 if slice_info is not None
