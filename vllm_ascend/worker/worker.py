@@ -781,6 +781,7 @@ class NPUWorker(WorkerBase):
             self.model_runner._dummy_run(
                 num_tokens=self.model_runner.decode_token_per_req,
                 uniform_decode=False,
+                layer_slice_info=layer_slice_info,
             )
             return None
         logger.info(
@@ -788,7 +789,9 @@ class NPUWorker(WorkerBase):
                 f"slice: {layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices}, "
                 f"layers: [{layer_slice_info.start_layer},{layer_slice_info.end_layer})"
                 if layer_slice_info is not None
-                else ""
+                else "slice: N/A"
+            ) + (
+                f", tokens={scheduler_output.total_num_scheduled_tokens}"
             )
         )
         intermediate_tensors = None
@@ -890,7 +893,6 @@ class NPUWorker(WorkerBase):
         # 0, not the slot after the cloud.
         if get_pp_group().world_size > 1:
             channel = self._hidden_channel_for(scheduler_output)
-            _hang_ret_rank = getattr(self.model_runner, "dp_rank", "?")
             # PD-separation diagnostic: log hidden_states norm at cloud output
             _hs_c = _gathered.get("hidden_states")
             if _hs_c is not None:
@@ -905,9 +907,6 @@ class NPUWorker(WorkerBase):
                                             dst=0),
                 channel=channel,
             )
-            logger.error("[HANG] cloud return isend EXIT: dp_rank=%s channel=%s",
-                        _hang_ret_rank, channel.value)
-            _hang_sys.stderr.flush()
             logger.info(f"Send intermediate tensors to edge, hidden_channel={channel.value}")
         return output
 
@@ -1253,14 +1252,29 @@ class NPUWorker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
-    def execute_dummy_batch(self) -> None:
+    def execute_dummy_batch(self, layer_slice_info: Any = None) -> None:
         # PD-separation: use uniform_decode=False (prefill-style attention)
         # instead of True (decode-style). Decode attention reads from the KV
         # cache which has real data from previous forwards, causing softmax
         # overflow -> NaN when the dummy's query (from zero input) interacts
         # with large real KV values. Prefill-style attention is causal (only
         # writes KV, doesn't read), avoiding the NaN.
-        self.model_runner._dummy_run(num_tokens=self.model_runner.decode_token_per_req, uniform_decode=False)
+        _lsi = layer_slice_info
+        logger.error(
+            "[SLICE-DIAG] execute_dummy_batch entry: layer_slice_info=%s "
+            "is_first=%s is_last=%s start=%s end=%s total=%s",
+            type(_lsi).__name__ if _lsi is not None else "None",
+            getattr(_lsi, "is_first_slice", None) if _lsi is not None else None,
+            getattr(_lsi, "is_last_slice", None) if _lsi is not None else None,
+            getattr(_lsi, "start_layer", None) if _lsi is not None else None,
+            getattr(_lsi, "end_layer", None) if _lsi is not None else None,
+            getattr(_lsi, "total_slices", None) if _lsi is not None else None,
+        )
+        self.model_runner._dummy_run(
+            num_tokens=self.model_runner.decode_token_per_req,
+            uniform_decode=False,
+            layer_slice_info=layer_slice_info,
+        )
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
