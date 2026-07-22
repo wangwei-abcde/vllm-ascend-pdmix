@@ -698,8 +698,6 @@ class PassiveScheduler:
         three-phase flow is used: decide → coordinate → apply.  Otherwise
         the original single-DP logic is used.
         """
-        if self.dp_coord_group is not None and self._is_coordinated_dp():
-            return self._schedule_expect_alternation_coordinated()
         return self._schedule_expect_alternation_simple()
 
     def _is_coordinated_dp(self) -> bool:
