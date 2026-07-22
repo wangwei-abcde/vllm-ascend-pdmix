@@ -15,6 +15,7 @@ The class is intentionally minimal: it shares no implementation with
 import enum
 import math
 import os
+import pickle
 import queue
 import threading
 import time
@@ -919,12 +920,13 @@ class PassiveScheduler:
     def _coordinate_decision(
         self, decision: SchedulerDecision
     ) -> SchedulerDecision:
-        """Cross-DP coordination: exchange decisions via all-reduce.
+        """Cross-DP coordination: exchange full decisions via all-reduce.
 
-        When ``dp_coord_group`` is set and this is a MoE model with
-        PD-separation, all DPs all-reduce their batch_type category.
-        dp0's decision wins; the other DP receives the winning
-        batch_type but keeps its own dispatch metadata.
+        Phase 1 — all-reduce batch_type categories to pick the winner
+        (dp0 preferred).  Phase 2 — all-reduce(MAX) the winner's
+        pickled SchedulerDecision so every DP receives the complete
+        decision (dispatch_queue, is_continuation, etc.), not just
+        the batch_type.
         """
         if self.dp_coord_group is None:
             return decision
@@ -962,29 +964,42 @@ class PassiveScheduler:
         tensor[_dp_rank] = _cat
         dist.all_reduce(tensor, group=self.dp_coord_group)
 
-        # dp0's decision takes priority, but if dp0 is idle, fall
-        # back to dp1's decision so a request bound to dp1 alone is
-        # not starved.
-        winner_cat = int(tensor[0].item())
-        if winner_cat == 0:
-            winner_cat = int(tensor[1].item())
-        if winner_cat == 0:
+        # Determine the winner rank from the category tensor.
+        # dp0 is checked first; if dp0 is idle, dp1 takes over
+        # so a request bound to dp1 alone is not starved.
+        winner_rank = -1
+        for r in range(_dp_size):
+            if tensor[r].item() != 0:
+                winner_rank = r
+                break
+
+        if winner_rank == -1:
             return SchedulerDecision()  # all idle
 
-        _winner_bt_map: dict[int, BatchType] = {
-            1: BatchType.PREFILL_FIRST,
-            2: BatchType.DECODE_FIRST,
-            3: BatchType.PD_MIX,
-        }
-        winner_bt = _winner_bt_map[winner_cat]
+        # Phase 2: all_reduce(MAX) transmits the winner's FULL
+        # SchedulerDecision (batch_type, dispatch_queue, is_continuation,
+        # token_count, new_state, throttle_action).
+        # Non-winners zero-fill their buffer; MAX(0, bytes) = bytes
+        # preserves the winner's data untouched.
+        _MAX_SER_LEN = 4096
+        buf_tensor = torch.zeros(_MAX_SER_LEN, dtype=torch.uint8,
+                                  device="cpu")
+        if _dp_rank == winner_rank:
+            data = pickle.dumps(decision)
+            if len(data) > _MAX_SER_LEN:
+                raise RuntimeError(
+                    f"SchedulerDecision serialized size "
+                    f"{len(data)} > {_MAX_SER_LEN}"
+                )
+            buf_tensor[:len(data)] = torch.tensor(
+                list(data), dtype=torch.uint8
+            )
 
-        # If the winner matches our decision, keep the full decision
-        # (token_count, dispatch_queue, etc.).  Otherwise adopt the
-        # winner's batch_type with empty metadata — the apply phase
-        # will produce a dummy for this DP.
-        if winner_bt == decision.batch_type:
-            return decision
-        return SchedulerDecision(batch_type=winner_bt)
+        dist.all_reduce(buf_tensor, op=dist.ReduceOp.MAX,
+                         group=self.dp_coord_group)
+
+        data = bytes(buf_tensor.tolist()).rstrip(b'\x00')
+        return pickle.loads(data)
 
     def _apply_decision_alternation(
         self, decision: SchedulerDecision
