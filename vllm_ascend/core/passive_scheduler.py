@@ -1002,6 +1002,12 @@ class PassiveScheduler:
         _is_decode = _bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST)
         _is_pdmix = _bt == BatchType.PD_MIX
 
+        if _bt is not None and (_is_prefill or _is_decode):
+            logger.info(
+                "[APPLY-DECISION] is_prefill=%s is_decode=%s",
+                _is_prefill, _is_decode,
+            )
+
         # --- state-machine transitions ---
         if decision.new_state is not None:
             self.cloud_scheduling_state = decision.new_state
@@ -1013,25 +1019,92 @@ class PassiveScheduler:
         # --- dispatch ---
         if decision.is_continuation:
             if self._active_prefill_slices:
+                if _bt is not None:
+                    logger.info(
+                        "[APPLY-DECISION] branch=continuation-real "
+                        "bt=%s active_slices=%d",
+                        _bt.value, len(self._active_prefill_slices),
+                    )
                 return self._build_active_prefill_slice_batch()
             # Continuation expected but not available — create dummy.
+            if _bt is not None:
+                logger.info(
+                    "[APPLY-DECISION] branch=continuation-dummy "
+                    "bt=%s (no active slices)",
+                    _bt.value,
+                )
             return self._make_dummy_batch(_bt)
 
         if _is_prefill:
             if decision.dispatch_queue == "ready_prefills" and self.ready_prefills:
+                if _bt is not None:
+                    logger.info(
+                        "[APPLY-DECISION] branch=prefill-real "
+                        "bt=%s queue=%s ready_prefills=%d",
+                        _bt.value, decision.dispatch_queue,
+                        len(self.ready_prefills),
+                    )
                 return self._build_batch(self.ready_prefills.popleft())
+            if _bt is not None:
+                logger.info(
+                    "[APPLY-DECISION] branch=prefill-dummy "
+                    "bt=%s queue=%s ready_prefills=%d "
+                    "dispatch_queue_match=%s ready_nonempty=%s",
+                    _bt.value, decision.dispatch_queue,
+                    len(self.ready_prefills),
+                    decision.dispatch_queue == "ready_prefills",
+                    bool(self.ready_prefills),
+                )
             return self._make_dummy_batch(_bt)
 
         if _is_decode:
             if decision.dispatch_queue == "ready_decodes" and self.ready_decodes:
+                if _bt is not None:
+                    logger.info(
+                        "[APPLY-DECISION] branch=decode-real "
+                        "bt=%s queue=%s ready_decodes=%d",
+                        _bt.value, decision.dispatch_queue,
+                        len(self.ready_decodes),
+                    )
                 return self._build_batch(self.ready_decodes.popleft())
+            if _bt is not None:
+                logger.info(
+                    "[APPLY-DECISION] branch=decode-dummy "
+                    "bt=%s queue=%s ready_decodes=%d "
+                    "dispatch_queue_match=%s ready_nonempty=%s",
+                    _bt.value, decision.dispatch_queue,
+                    len(self.ready_decodes),
+                    decision.dispatch_queue == "ready_decodes",
+                    bool(self.ready_decodes),
+                )
             return self._make_dummy_batch(_bt)
 
         if _is_pdmix:
             if decision.dispatch_queue == "ready_pdmixes" and self.ready_pdmixes:
+                if _bt is not None:
+                    logger.info(
+                        "[APPLY-DECISION] branch=pdmix-real "
+                        "bt=%s queue=%s ready_pdmixes=%d",
+                        _bt.value, decision.dispatch_queue,
+                        len(self.ready_pdmixes),
+                    )
                 return self._build_batch(self.ready_pdmixes.popleft())
+            if _bt is not None:
+                logger.info(
+                    "[APPLY-DECISION] branch=pdmix-dummy "
+                    "bt=%s queue=%s ready_pdmixes=%d "
+                    "dispatch_queue_match=%s ready_nonempty=%s",
+                    _bt.value, decision.dispatch_queue,
+                    len(self.ready_pdmixes),
+                    decision.dispatch_queue == "ready_pdmixes",
+                    bool(self.ready_pdmixes),
+                )
             return self._make_dummy_batch(_bt)
 
+        if _bt is not None:
+            logger.info(
+                "[APPLY-DECISION] branch=empty-fallback bt=%s", _bt.value,
+            )
         return ScheduledBatch.empty()
 
     def _make_dummy_batch(self, batch_type: BatchType) -> ScheduledBatch:

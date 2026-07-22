@@ -562,6 +562,10 @@ class PassiveEngineCoreProc:
         if batch.is_empty():
             return False
 
+        # 打印 batch.slices
+        logger.info("batch.slices: %s", batch.slices)
+
+
         for slice_info in batch.slices:
             worker_scheduler_output = _trim_scheduler_output_for_worker_enqueue(
                 batch.scheduler_output,
