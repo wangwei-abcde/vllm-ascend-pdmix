@@ -664,6 +664,9 @@ class PassiveEngineCoreProc:
                 # to the busy-loop.
                 return False
             else:
+                _dp_r = self.vllm_config.parallel_config.data_parallel_rank
+                logger.error("[PD-DIAG] coord dispatch: dp_rank=%s _coord_winner=%s",
+                            _dp_r, _coord_winner)
                 batch = self.passive_scheduler.schedule(
                     target_batch_type=_coord_winner
                 )
