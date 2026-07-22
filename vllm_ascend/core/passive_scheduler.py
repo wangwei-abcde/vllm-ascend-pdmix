@@ -590,61 +590,13 @@ class PassiveScheduler:
         )
         return False
 
-    def schedule(
-        self, target_batch_type: BatchType | None = None,
-        force_dummy: bool = False,
-    ) -> ScheduledBatch:
+    def schedule(self) -> ScheduledBatch:
         """Pick the next SchedulerOutput to dispatch.
 
         ``EXPECT_ALTERNATION`` implements the Phase7 cloud-side EEP/EED state
         machine.  Sliced prefill-like batches are dispatched one slice per call
         so decode batches can be interleaved between the remaining slices.
-
-        When ``target_batch_type`` is set (cross-DP coordination active), the
-        EEP/EED state machine is consulted first: if it naturally agrees with
-        the target, the normal path runs (state machine transitions normally).
-        If the state machine disagrees or has nothing for the target, a dummy
-        batch is produced to keep cloud-side EP all-toall paired across DPs.
-
-        When ``force_dummy`` is True (both DPs idle, winner=None), both sides
-        produce a dummy batch unconditionally — never pop from ready queues,
-        because real vs dummy would cause EP all-toall mismatch (different
-        token counts → different a2a call counts).
         """
-        # --- cross-DP coordination path ---
-        if target_batch_type is not None:
-            # If the EEP/EED state machine naturally picks the target, let it
-            # run normally so the state machine transitions correctly.
-            if not force_dummy:
-                _intended = self._intended_batch_type()
-                if _intended is not None:
-                    _intended_cat = _intended
-                    _target_cat = target_batch_type
-                    _same_category = (
-                        (_intended_cat in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST)
-                         and _target_cat in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST))
-                        or (_intended_cat in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST)
-                            and _target_cat in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST))
-                        or (_intended_cat == BatchType.PD_MIX
-                            and _target_cat == BatchType.PD_MIX)
-                    )
-                    if _same_category:
-                        # State machine agrees — run the normal path.
-                        if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
-                            return self._schedule_expect_alternation()
-                        for queue_name in self._POLICY_ORDER[self.dispatch_policy]:
-                            batch = self._schedule_from_queue(queue_name)
-                            if not batch.is_empty():
-                                return batch
-
-            # State machine disagrees, has nothing, or force_dummy —
-            # force-dispatch the target (which includes the active-slice
-            # continuation path).
-            return self._force_schedule_target(
-                target_batch_type, force_dummy=force_dummy,
-            )
-
-        # --- normal (non-coordinated) path ---
         if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
             return self._schedule_expect_alternation()
 
@@ -652,115 +604,6 @@ class PassiveScheduler:
             batch = self._schedule_from_queue(queue_name)
             if not batch.is_empty():
                 return batch
-
-        return ScheduledBatch.empty()
-
-    # ------------------------------------------------------------------ #
-    # Cross-DP coordination helpers (cloud side)                          #
-    # ------------------------------------------------------------------ #
-
-    def _intended_batch_type(self) -> BatchType | None:
-        """Read-only query: what batch_type would ``schedule()`` pick next,
-        without any side effects (no queue popping, no state transitions).
-
-        Normal (non-coordinated) ``schedule()`` calls this internally to
-        check whether the EEP/EED state machine agrees with the coordinated
-        target before deciding to run the normal path or force-dispatch.
-
-        Returns the batch_type or None if nothing is available.
-        """
-        # Active sliced prefill continuation always has priority.
-        if self._active_prefill_slices and self._active_sliced_prefill is not None:
-            return self._active_sliced_prefill.batch_type
-
-        if self.dispatch_policy == DispatchPolicy.EXPECT_ALTERNATION:
-            state = self.cloud_scheduling_state
-            if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
-                if self.ready_prefills:
-                    return self.ready_prefills[0].batch_type
-                if self.ready_decodes:
-                    return self.ready_decodes[0].batch_type
-            else:  # EXPECT_EXECUTE_DECODE
-                if self.ready_decodes:
-                    return self.ready_decodes[0].batch_type
-                if self._can_fallback_to_prefill_in_decode_state():
-                    if self.ready_prefills:
-                        return self.ready_prefills[0].batch_type
-            if self.ready_pdmixes:
-                return self.ready_pdmixes[0].batch_type
-            return None
-
-        # Other policies: walk queues in priority order.
-        for queue_name in self._POLICY_ORDER[self.dispatch_policy]:
-            if queue_name == "ready_decodes" and self._active_prefill_slices:
-                continue  # active prefill slices block prefill-like queues
-            q: deque = getattr(self, queue_name)
-            if q:
-                return q[0].batch_type
-        return None
-
-    def _force_schedule_target(
-        self, target_bt: BatchType, force_dummy: bool = False,
-    ) -> ScheduledBatch:
-        """Force-dispatch the given ``target_bt``.
-
-        When ``force_dummy`` is False and the matching queue is non-empty,
-        the real SO is dispatched.  When the queue is empty (or
-        ``force_dummy`` is True), a dummy is produced.
-
-        Unlike ``schedule()`` this does **not** consult or update the
-        EEP/EED state machine.  It is only called when a cross-DP
-        coordination winner is selected and the local state machine either
-        has nothing to offer or disagrees on the category.
-
-        The dummy batch has ``total_num_scheduled_tokens == 0`` and
-        ``is_pd_dummy == True`` so the cloud worker runs ``_dummy_run``:
-        still participates in EP all-toall but skips real hidden-state
-        computation.
-        """
-        # Active sliced prefill / pdmix continuation takes priority over
-        # the ready queue — the ready queue was consumed by slice-0.
-        if not force_dummy:
-            if self._active_prefill_slices and self._active_sliced_prefill is not None:
-                _active_bt = self._active_sliced_prefill.batch_type
-                if (
-                    _active_bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST)
-                    and target_bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST)
-                ):
-                    return self._build_active_prefill_slice_batch()
-                if (
-                    _active_bt == BatchType.PD_MIX
-                    and target_bt == BatchType.PD_MIX
-                ):
-                    return self._build_active_prefill_slice_batch()
-
-        # Route to the correct queue (skip when force_dummy).
-        if target_bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):
-            if not force_dummy and self.ready_prefills:
-                return self._build_batch(self.ready_prefills.popleft())
-            # Queue empty or force_dummy: make a dummy prefill.
-            so = SchedulerOutput.make_empty()
-            so.batch_type = BatchType.PREFILL_FIRST
-            setattr(so, "is_pd_dummy", True)
-            return self._build_batch(so)
-
-        if target_bt in (BatchType.PURE_DECODE, BatchType.DECODE_FIRST):
-            if not force_dummy and self.ready_decodes:
-                return self._build_batch(self.ready_decodes.popleft())
-            # Queue empty or force_dummy: make a dummy decode.
-            so = SchedulerOutput.make_empty()
-            so.batch_type = BatchType.DECODE_FIRST
-            setattr(so, "is_pd_dummy", True)
-            slices = self._slice_for(so)
-            return ScheduledBatch(scheduler_output=so, slices=slices)
-
-        if target_bt == BatchType.PD_MIX:
-            if not force_dummy and self.ready_pdmixes:
-                return self._build_batch(self.ready_pdmixes.popleft())
-            so = SchedulerOutput.make_empty()
-            so.batch_type = BatchType.PD_MIX
-            setattr(so, "is_pd_dummy", True)
-            return self._build_batch(so)
 
         return ScheduledBatch.empty()
 
