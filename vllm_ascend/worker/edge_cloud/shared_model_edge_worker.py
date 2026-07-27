@@ -266,6 +266,7 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
         per_dp_hidden_list = leader_runner.execute_model_batched_head(
             bundles,
             batched_dp_ranks=batched_dp_ranks,
+            pp_send_work_by_channel=getattr(leader, "_pp_send_work_by_channel", None),
         )
         # Key the per-dp_rank hidden slices by dp_rank rather
         # than by their position in ``batched_dp_ranks``: this
@@ -406,12 +407,21 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
             # ``self._get_or_build_merged_attn_ctx`` from the head
             # segment), so the worker only forwards
             # ``batched_dp_ranks``.
+            logger.info(
+                "[PD] drain_batched_round: calling "
+                "execute_model_batched_tail dp_ranks=%s",
+                ok_dp_ranks)
             try:
                 (merged_hidden, merged_sample_hidden, merged_logits,
                  kv_connector_output) = (
                     leader_runner.execute_model_batched_tail(
                         bundles, intermediates,
-                        batched_dp_ranks=ok_dp_ranks))
+                        batched_dp_ranks=ok_dp_ranks,
+                        pp_send_work_by_channel=getattr(leader, "_pp_send_work_by_channel", None)))
+                logger.info(
+                    "[PD] drain_batched_round: "
+                    "execute_model_batched_tail returned "
+                    "dp_ranks=%s", ok_dp_ranks)
 
                 # 3. Slice merged tensors back to per-dp_rank and
                 #    run per-dp_rank post_batched. The slice
@@ -483,6 +493,168 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
             leader_worker.model_runner._merged_attn_ctx_cache = None
         round_bundles.clear()
         round_intermediates.clear()
+
+
+class _FirstRoundMarker(DeferredExecutePostprocess):
+    """PD-separation FIRST-round marker: head-forward + isend only.
+
+    Does NOT participate in Phase B/C (recv + tail + logits).
+    The recv closure is registered into the cross-round
+    ``_pd_recv_closures`` cache (owned by
+    :class:`SharedModelWorkerProc`) and is consumed by the matching
+    LAST round.
+    """
+
+    # Class-level cache of per-dp_rank head hidden slices (same
+    # semantics as ``_BatchedExecuteMarker._per_dp_hidden``).
+    _per_dp_hidden: dict[int, Any] | None = None
+
+    __slots__ = ("bundle", "worker")
+
+    def __init__(
+        self,
+        bundle: "_ExecuteModelBundle",
+        worker: "SharedModelEdgeWorker",
+    ) -> None:
+        self.bundle = bundle
+        self.worker = worker
+        super().__init__(postprocess=lambda: None)
+
+    # ------------------------------------------------------------------
+    # Phase A — batched head (1× per round, dp_rank / self-agnostic)
+    # ------------------------------------------------------------------
+    @classmethod
+    def run_batched_head(
+        cls,
+        batched_dp_ranks: list[int],
+        round_bundles: dict[int, "_ExecuteModelBundle"],
+    ) -> dict[int, Any]:
+        """Run the 1× batched head forward on the leader runner.
+
+        Identical to :meth:`_BatchedExecuteMarker.run_batched_head`.
+        """
+        leader = next(
+            (w for w in _SHARED_MODEL_REGISTRY
+             if getattr(w, "_is_leader", False)), None)
+        assert leader is not None, (
+            "SharedModelEdgeWorker: no leader worker found in "
+            "_SHARED_MODEL_REGISTRY when running FIRST batched head")
+        leader_runner = leader.model_runner
+        bundles = [round_bundles[k] for k in batched_dp_ranks]
+        total_tokens = sum(
+            b.scheduler_output.total_num_scheduled_tokens for b in bundles)
+        logger.info(
+            "[PD] FIRST head: dp_ranks=%s num_tokens=%d (total bundled)",
+            batched_dp_ranks, total_tokens)
+        per_dp_hidden_list = leader_runner.execute_model_batched_head(
+            bundles,
+            batched_dp_ranks=batched_dp_ranks,
+            pp_send_work_by_channel=getattr(leader, "_pp_send_work_by_channel", None),
+        )
+        cls._per_dp_hidden = dict(zip(batched_dp_ranks,
+                                       per_dp_hidden_list))
+        # Clear the merged-attn-ctx cache on the leader runner so
+        # the matching LAST round rebuilds it from its own bundles
+        # instead of reusing FIRST's stale cache.
+        leader.model_runner._merged_attn_ctx_cache = None
+        return cls._per_dp_hidden
+
+    # ------------------------------------------------------------------
+    # Phase A — per-dp_rank PP isend (no recv closure)
+    # ------------------------------------------------------------------
+    def drive_head_send(self) -> None:
+        """Per-dp_rank isend to cloud.
+
+        Only does the send — recv is deferred to the matching
+        LAST round, which directly calls
+        :meth:`_LastRoundMarker.do_direct_recv`.
+        """
+        per_dp_hidden = _FirstRoundMarker._per_dp_hidden
+        assert per_dp_hidden is not None, (
+            "_FirstRoundMarker.drive_head_send called before "
+            "run_batched_head populated _per_dp_hidden")
+        dp_rank = self.worker.local_rank
+        hidden_k = per_dp_hidden[dp_rank]
+        # Edge-cloud with heterogeneous SP: aggregate SP shards to
+        # full sequence before cross-PP send.
+        if enable_sp() and (
+                self.worker.model_runner.edge_cloud_cfg.mode
+                != "embedding_only"
+                or not self.worker.model_runner.supports_mm_inputs):
+            _gathered = self.worker._all_gather_tensor_dict(
+                hidden_k.tensors)
+        else:
+            _gathered = hidden_k.tensors
+        num_tokens = (
+            self.bundle.scheduler_output.total_num_scheduled_tokens)
+        logger.info(
+            "[PD] FIRST isend: dp_rank=%d num_tokens=%d dst=%d",
+            dp_rank, num_tokens, dp_rank + 1)
+        # Wait for previous send on this channel before launching
+        # a new one (mirrors NPUWorker.execute_model L564-576).
+        channel = self.worker._hidden_channel_for(
+            self.bundle.scheduler_output)
+        print(f"[PD DEBUG] drive_head_send: channel={channel}, dp_rank={dp_rank}, dst={dp_rank + 1}")
+        self.worker._wait_pp_send_work(channel)
+        handles = edge_cloud_isend_tensor_dict(
+            _gathered,
+            dst=dp_rank + 1,
+            num_tokens=num_tokens,
+            channel=channel,
+        )
+        self.worker._record_pp_send_work(handles, channel)
+
+
+class _LastRoundMarker(_BatchedExecuteMarker):
+    """PD-separation LAST-round marker: recv + tail-forward only.
+
+    Inherits from :class:`_BatchedExecuteMarker` to reuse
+    :meth:`drain_batched_round` (Phase B/C). Does NOT define
+    ``run_batched_head`` or ``drive_batched_round`` — those are
+    skipped by the busy_loop's three-way split.
+
+    Recv is done directly via :meth:`do_direct_recv` (no closure),
+    mirroring :meth:`vllm_ascend.worker.worker.NPUWorker._execute_model_edge_tail`.
+    """
+
+    __slots__ = ()
+
+    def do_direct_recv(self) -> "AsyncIntermediateTensors":
+        """Directly receive cloud intermediate tensors.
+
+        Parameters are derived from this marker's own
+        ``scheduler_output`` (num_tokens) and worker config
+        (sp_chunk), NOT from a pre-stored closure. This is the
+        same approach as
+        :meth:`NPUWorker._execute_model_edge_tail`.
+        """
+        edge_sp = enable_sp()
+        edge_merge = get_edge_cloud_tensor_meta().merge_payload
+        dp_rank = self.worker.local_rank
+        num_tokens = (
+            self.bundle.scheduler_output.total_num_scheduled_tokens)
+        logger.info(
+            "[PD] LAST recv: dp_rank=%d num_tokens=%d src=%d",
+            dp_rank, num_tokens, dp_rank + 1)
+        # Wait for the FIRST round's isend on this channel to
+        # complete before we recv the cloud's response
+        # (mirrors NPUWorker.execute_model L564-576).
+        channel = self.worker._hidden_channel_for(
+            self.bundle.scheduler_output)
+        print(f"[PD DEBUG] do_direct_recv: channel={channel}, dp_rank={dp_rank}, src={dp_rank + 1}")
+        self.worker._wait_pp_send_work(channel)
+        tensor_dict, comm_handles, comm_postprocess = (
+            edge_cloud_broadcast_recv(
+                num_tokens=num_tokens,
+                sp_chunk=edge_sp and edge_merge,
+                src=dp_rank + 1,
+                channel=channel,
+            ))
+        return AsyncIntermediateTensors(
+            tensor_dict,
+            comm_handles=comm_handles,
+            comm_postprocess=comm_postprocess,
+        )
 
 
 class SharedModelEdgeWorker(NPUWorker):
@@ -851,6 +1023,83 @@ class SharedModelEdgeWorker(NPUWorker):
         # ``EMPTY_MODEL_RUNNER_OUTPUT`` / ``None`` directly; pass it
         # through unchanged so the busy_loop routes it via
         # ``handle_output``.
+        return result
+
+    # ------------------------------------------------- PD-separation entries
+    def execute_model_head_pre(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> "_FirstRoundMarker | ModelRunnerOutput | None":
+        """FIRST-round entry for PD separation: full preprocess,
+        return :class:`_FirstRoundMarker`.
+
+        Logic mirrors :meth:`execute_model_batched_pre` — the only
+        difference is the marker type returned to the busy_loop.
+        The FIRST marker signals to the busy_loop that only
+        Phase A (head + isend) is needed; no recv / tail / logits.
+        """
+        from vllm_ascend import envs as envs_ascend
+
+        if envs_ascend.MSMONITOR_USE_DAEMON:
+            from vllm_ascend.profiler.torch_npu_profiler import (
+                dynamic_profile as dp,
+            )
+            dp.step()
+        if self._pp_send_work:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+        if self.profiler is not None:
+            self.profiler.step()
+
+        bt = getattr(scheduler_output, "batch_type", None)
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        logger.info(
+            "[PD] execute_model_head_pre: dp_rank=%d batch_type=%s "
+            "num_tokens=%d",
+            self.local_rank, bt, num_tokens)
+        result = self.model_runner.execute_model_pre(scheduler_output)
+        if isinstance(result, _ExecuteModelBundle):
+            return _FirstRoundMarker(bundle=result, worker=self)
+        return result
+
+    def execute_model_tail_pre(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> "_LastRoundMarker | ModelRunnerOutput | None":
+        """LAST-round entry for PD separation: full preprocess + recv + tail.
+
+        Calls :meth:`BatchedModelRunner.execute_model_pre` to get a
+        REAL bundle (with attention metadata built from the LAST
+        request's own SO), NOT a placeholder — matching the
+        multi-card :meth:`NPUWorker._execute_model_edge_tail`
+        approach where ``execute_model`` is called independently
+        for each stage.
+        """
+        # Drain in-flight PP sends from any preceding FIRST round
+        # before the LAST round's preprocessing begins.
+        if self._pp_send_work:
+            logger.info(
+                "[PD] execute_model_tail_pre: waiting for %d isend handles "
+                "dp_rank=%d",
+                len(self._pp_send_work), self.local_rank)
+            for handle in self._pp_send_work:
+                handle.wait()
+            logger.info(
+                "[PD] execute_model_tail_pre: all isend handles waited "
+                "dp_rank=%d",
+                self.local_rank)
+            self._pp_send_work = []
+
+        bt = getattr(scheduler_output, "batch_type", None)
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        logger.info(
+            "[PD] execute_model_tail_pre: dp_rank=%d batch_type=%s "
+            "num_tokens=%d",
+            self.local_rank, bt, num_tokens)
+        result = self.model_runner.execute_model_pre(scheduler_output)
+        if isinstance(result, _ExecuteModelBundle):
+            return _LastRoundMarker(bundle=result, worker=self)
         return result
 
     def make_batched_recv_closure(

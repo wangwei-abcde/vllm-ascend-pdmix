@@ -166,18 +166,40 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
             assert self.cpu_group is not None
             assert self.device_group is not None
+            logger.info(
+                "[PP Group] PREFILL_1 device_group: group_name=%s ranks=%s "
+                "size=%d backend=%s",
+                group_name, self.ranks, self.world_size,
+                self.backend,
+            )
 
-            # Alternate device/cpu groups for dual-channel PP communication.
-            # When set, these provide a second independent communication channel
-            # over the same ranks. Used in PP to separate decode from
-            # non-decode traffic.
-            self.alt_device_group: torch.distributed.ProcessGroup | None = None
-            self.alt_cpu_group: torch.distributed.ProcessGroup | None = None
-            # Phase6 hidden data-plane channels. The default device/cpu groups
-            # are PREFILL_1, the legacy alt groups are DECODE, and the extra
-            # hidden groups below are PREFILL_2.
-            self.prefill2_device_group: torch.distributed.ProcessGroup | None = None
-            self.prefill2_cpu_group: torch.distributed.ProcessGroup | None = None
+            # Phase6 hidden data-plane channel groups (array-based for DP scalability).
+            #
+            # PREFILL channels: _prefill_device_groups[idx] / _prefill_cpu_groups[idx]
+            #   idx 0 -> PREFILL_1  (device_group / cpu_group)
+            #   idx 1 -> PREFILL_2  (pg_options="pp_prefill2")
+            #   idx N -> PREFILL_{N+1}(pg_options="pp_prefill{N+1}")
+            #
+            # DECODE channels: _decode_device_groups[idx] / _decode_cpu_groups[idx]
+            #   idx 0 -> DECODE_1   (pg_options="pp_alt")
+            #   idx M -> DECODE_{M+1}(pg_options="pp_decode{M+1}")
+            #
+            # Backward-compat aliases (via @property):
+            #   alt_device_group       -> _decode_device_groups[0]
+            #   alt_cpu_group          -> _decode_cpu_groups[0]
+            #   prefill2_device_group  -> _prefill_device_groups[1]
+            #   prefill2_cpu_group     -> _prefill_cpu_groups[1]
+            self._prefill_device_groups: list[torch.distributed.ProcessGroup] = []
+            self._prefill_cpu_groups: list[torch.distributed.ProcessGroup] = []
+            self._decode_device_groups: list[torch.distributed.ProcessGroup] = []
+            self._decode_cpu_groups: list[torch.distributed.ProcessGroup] = []
+
+            # Seed index-0 with the primary PP group (PREFILL_1) so that
+            # len(_prefill_device_groups) is 1 and the range in
+            # create_hidden_channel_groups starts at PREFILL_2 instead of
+            # creating a wasted PREFILL_1 that is never read.
+            self._prefill_device_groups.append(self.device_group)
+            self._prefill_cpu_groups.append(self.cpu_group)
 
             self.device = torch.npu.current_device()
             if use_device_communicator and self.world_size > 1:
@@ -231,25 +253,16 @@ class GroupCoordinatorPatch(GroupCoordinator):
             device_communicator.destroy()
             self.device_communicator = None
 
-        alt_cpu_group = getattr(self, "alt_cpu_group", None)
-        if alt_cpu_group is not None:
-            torch.distributed.destroy_process_group(alt_cpu_group)
-            self.alt_cpu_group = None
-
-        alt_device_group = getattr(self, "alt_device_group", None)
-        if alt_device_group is not None:
-            torch.distributed.destroy_process_group(alt_device_group)
-            self.alt_device_group = None
-
-        prefill2_cpu_group = getattr(self, "prefill2_cpu_group", None)
-        if prefill2_cpu_group is not None:
-            torch.distributed.destroy_process_group(prefill2_cpu_group)
-            self.prefill2_cpu_group = None
-
-        prefill2_device_group = getattr(self, "prefill2_device_group", None)
-        if prefill2_device_group is not None:
-            torch.distributed.destroy_process_group(prefill2_device_group)
-            self.prefill2_device_group = None
+        # Destroy hidden channel groups (array-based).
+        for groups in (self._prefill_device_groups, self._prefill_cpu_groups,
+                       self._decode_device_groups, self._decode_cpu_groups):
+            for pg in groups:
+                if pg is not None:
+                    torch.distributed.destroy_process_group(pg)
+        self._prefill_device_groups.clear()
+        self._prefill_cpu_groups.clear()
+        self._decode_device_groups.clear()
+        self._decode_cpu_groups.clear()
 
         if getattr(self, "mq_broadcaster", None) is not None:
             self.mq_broadcaster = None
@@ -258,84 +271,192 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self,
         torch_distributed_backend: str | Backend,
     ) -> None:
-        """Create alternate device and cpu groups over the same ranks.
+        """Create DECODE_1 device/cpu groups over the same ranks.
 
-        Must be called collectively by all ranks in the **default** group
-        (i.e. every rank that participates in ``torch.distributed``), because
-        ``torch.distributed.new_group`` is a collective operation on the
-        default group. After calling this, communication methods can use
-        ``use_alt_group=True`` to route through the alternate
-        communication channel.
+        Populates ``_decode_device_groups[0]`` / ``_decode_cpu_groups[0]``
+        (the first decode channel).  ``torch.distributed.new_group`` is a
+        collective on the default group, so every rank must participate.
         """
-        assert self.alt_device_group is None, (
-            "Alternate groups already created"
+        assert not self._decode_device_groups, (
+            "Alternate (DECODE_1) groups already created"
         )
         hccl_pg_options = create_hccl_pg_options("pp_alt")
-        self_alt_device_group = None
-        self_alt_cpu_group = None
-        # Iterate over ALL subgroups so that every rank participates in
-        # every new_group call (required because new_group is collective
-        # on the default group).  Only save the group this rank belongs to.
-        for ranks in self._all_group_ranks:
-            alt_device_group = torch.distributed.new_group(
-                ranks,
-                backend=torch_distributed_backend,
-                pg_options=hccl_pg_options,
-            )
-            alt_cpu_group = torch.distributed.new_group(
-                ranks, backend="gloo"
-            )
-            if self.rank in ranks:
-                self_alt_device_group = alt_device_group
-                self_alt_cpu_group = alt_cpu_group
-        assert self_alt_device_group is not None
-        assert self_alt_cpu_group is not None
-        self.alt_device_group = self_alt_device_group
-        self.alt_cpu_group = self_alt_cpu_group
-
-    def create_hidden_channel_groups(
-        self,
-        torch_distributed_backend: str | Backend,
-    ) -> None:
-        """Create the extra Phase6 PREFILL_2 group.
-
-        The default pp group is PREFILL_1 and the existing alternate group is
-        DECODE.  This method adds PREFILL_2 as the third independent data-plane
-        channel over the same ranks.
-        """
-        assert self.prefill2_device_group is None, (
-            "PREFILL_2 hidden channel group already created"
-        )
-        hccl_pg_options = create_hccl_pg_options("pp_prefill2")
-        prefill2_device_group = None
-        prefill2_cpu_group = None
+        decode_device_group = None
+        decode_cpu_group = None
         for ranks in self._all_group_ranks:
             device_group = torch.distributed.new_group(
                 ranks,
                 backend=torch_distributed_backend,
                 pg_options=hccl_pg_options,
             )
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            cpu_group = torch.distributed.new_group(
+                ranks, backend="gloo"
+            )
             if self.rank in ranks:
-                prefill2_device_group = device_group
-                prefill2_cpu_group = cpu_group
-        assert prefill2_device_group is not None
-        assert prefill2_cpu_group is not None
-        self.prefill2_device_group = prefill2_device_group
-        self.prefill2_cpu_group = prefill2_cpu_group
+                decode_device_group = device_group
+                decode_cpu_group = cpu_group
+        assert decode_device_group is not None
+        assert decode_cpu_group is not None
+        self._decode_device_groups.append(decode_device_group)
+        self._decode_cpu_groups.append(decode_cpu_group)
+        logger.info(
+            "[PP Group] DECODE_1 device_group: ranks=%s size=%d "
+            "backend=%s",
+            self.ranks, self.world_size, self.backend,
+        )
+
+    def create_hidden_channel_groups(
+        self,
+        torch_distributed_backend: str | Backend,
+        num_prefill: int = 2,
+        num_decode: int = 1,
+    ) -> None:
+        """Create extra hidden-channel groups for DP-scalable PD separation.
+
+        The default device/cpu groups are PREFILL_1.
+        ``_decode_device_groups[0]`` (DECODE_1) is created by
+        ``create_alternate_groups``.
+
+        This method adds:
+          - PREFILL_2..num_prefill  (append to ``_prefill_device_groups``)
+          - DECODE_2..num_decode    (append to ``_decode_device_groups``)
+
+        Each group uses a unique ``pg_options`` name for HCCL stream isolation.
+        """
+        # --- PREFILL groups (2..N) ---
+        # PREFILL_1 uses device_group; PREFILL_2 uses existing prefill2 alias.
+        print(
+            "[PD] _create_prefill: len(prefill)=%d range(%d,%d) "
+            "num_prefill=%d"
+            % (len(self._prefill_device_groups),
+               len(self._prefill_device_groups) + 1, num_prefill + 1,
+               num_prefill),
+            flush=True,
+        )
+        for i in range(len(self._prefill_device_groups) + 1, num_prefill + 1):
+            print("[PD] _create_prefill: i=%d pg_name=pp_prefill%d" % (i, i), flush=True)
+            self._create_one_hidden_channel(
+                f"pp_prefill{i}", torch_distributed_backend,
+                self._prefill_device_groups, self._prefill_cpu_groups,
+            )
+
+        # --- DECODE groups (2..M) ---
+        for i in range(len(self._decode_device_groups) + 1, num_decode + 1):
+            self._create_one_hidden_channel(
+                f"pp_decode{i}", torch_distributed_backend,
+                self._decode_device_groups, self._decode_cpu_groups,
+            )
+
+    def _create_one_hidden_channel(
+        self,
+        pg_name: str,
+        backend: str | Backend,
+        device_list: list[torch.distributed.ProcessGroup],
+        cpu_list: list[torch.distributed.ProcessGroup],
+    ) -> None:
+        """Create one hidden channel using *pg_name* as the HCCL pg_options key."""
+        hccl_pg_options = create_hccl_pg_options(pg_name)
+        device_group = None
+        cpu_group = None
+        for ranks in self._all_group_ranks:
+            dg = torch.distributed.new_group(
+                ranks, backend=backend, pg_options=hccl_pg_options,
+            )
+            cg = torch.distributed.new_group(ranks, backend="gloo")
+            if self.rank in ranks:
+                device_group = dg
+                cpu_group = cg
+        assert device_group is not None
+        assert cpu_group is not None
+        device_list.append(device_group)
+        cpu_list.append(cpu_group)
+        print(
+            "[PP Group] %s hidden channel: ranks=%s size=%d backend=%s"
+            % (pg_name, self.ranks, self.world_size, self.backend),
+            flush=True,
+        )
+
+    @property
+    def alt_device_group(self) -> torch.distributed.ProcessGroup | None:
+        """Backward-compat: DECODE_1 (``_decode_device_groups[0]``)."""
+        return self._decode_device_groups[0] if self._decode_device_groups else None
+
+    @property
+    def alt_cpu_group(self) -> torch.distributed.ProcessGroup | None:
+        """Backward-compat: DECODE_1 cpu group."""
+        return self._decode_cpu_groups[0] if self._decode_cpu_groups else None
+
+    @alt_device_group.setter
+    def alt_device_group(self, v):
+        if v is None:
+            return
+        if not self._decode_device_groups:
+            self._decode_device_groups.append(v)
+        else:
+            self._decode_device_groups[0] = v
+
+    @alt_cpu_group.setter
+    def alt_cpu_group(self, v):
+        if v is None:
+            return
+        if not self._decode_cpu_groups:
+            self._decode_cpu_groups.append(v)
+        else:
+            self._decode_cpu_groups[0] = v
+
+    @property
+    def prefill2_device_group(self) -> torch.distributed.ProcessGroup | None:
+        """Backward-compat: PREFILL_2 (``_prefill_device_groups[1]``)."""
+        return (self._prefill_device_groups[1]
+                if len(self._prefill_device_groups) > 1 else None)
+
+    @property
+    def prefill2_cpu_group(self) -> torch.distributed.ProcessGroup | None:
+        """Backward-compat: PREFILL_2 cpu group."""
+        return (self._prefill_cpu_groups[1]
+                if len(self._prefill_cpu_groups) > 1 else None)
+
+    @prefill2_device_group.setter
+    def prefill2_device_group(self, v):
+        if v is None:
+            return
+        while len(self._prefill_device_groups) < 2:
+            self._prefill_device_groups.append(None)
+        self._prefill_device_groups[1] = v
+
+    @prefill2_cpu_group.setter
+    def prefill2_cpu_group(self, v):
+        if v is None:
+            return
+        while len(self._prefill_cpu_groups) < 2:
+            self._prefill_cpu_groups.append(None)
+        self._prefill_cpu_groups[1] = v
 
     def _hidden_channel_groups(self, channel: Any):
+        """Resolve a HiddenChannelType to (device_group, cpu_group).
+
+        Uses array-indexed lookup for scalability::
+
+            "prefill_N" -> _prefill_device_groups[N-1]
+            "decode_M"  -> _decode_device_groups[M-1]
+
+        The values ``"decode"`` and ``"decode_1"`` both map to DECODE_1
+        (backward compatibility).
+        """
         value = getattr(channel, "value", channel)
+        logger.debug("[PP Group] _hidden_channel_groups: channel=%s -> value=%s",
+                     channel, value)
         if value == "prefill_1":
             return self.device_group, self.cpu_group
         if value == "decode":
-            assert self.alt_device_group is not None
-            assert self.alt_cpu_group is not None
-            return self.alt_device_group, self.alt_cpu_group
-        if value == "prefill_2":
-            assert self.prefill2_device_group is not None
-            assert self.prefill2_cpu_group is not None
-            return self.prefill2_device_group, self.prefill2_cpu_group
+            # backward-compat: old DECODE alias
+            value = "decode_1"
+        if value.startswith("prefill_"):
+            idx = int(value.split("_")[1]) - 1
+            return self._prefill_device_groups[idx], self._prefill_cpu_groups[idx]
+        if value.startswith("decode_"):
+            idx = int(value.split("_")[1]) - 1
+            return self._decode_device_groups[idx], self._decode_cpu_groups[idx]
         raise ValueError(f"Unknown hidden channel: {channel}")
 
     def send_object_on_hidden_channel(

@@ -871,6 +871,7 @@ class BatchedModelRunner(NPUModelRunner):
         self,
         bundles: list[_ExecuteModelBundle],
         batched_dp_ranks: list[int] | None = None,
+        pp_send_work_by_channel: dict | None = None,
     ) -> list[IntermediateTensors]:
         """1 batched head model_forward = 1 ``model.embed_tokens``.
 
@@ -907,7 +908,8 @@ class BatchedModelRunner(NPUModelRunner):
                 "execute_model_batched_head: batched_dp_ranks "
                 "required for non-embedding_only edge mode.")
             ctx = self._get_or_build_merged_attn_ctx(
-                bundles, batched_dp_ranks)
+                bundles, batched_dp_ranks,
+                pp_send_work_by_channel=pp_send_work_by_channel)
             head_attn_metadata: Any = ctx.merged_attn_metadata
             batch_descriptor = ctx.merged_batch_descriptor
             cudagraph_mode = ctx.merged_cudagraph_mode
@@ -1027,6 +1029,7 @@ class BatchedModelRunner(NPUModelRunner):
         bundles: list[_ExecuteModelBundle],
         intermediates: list[IntermediateTensors],
         batched_dp_ranks: list[int] | None = None,
+        pp_send_work_by_channel: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
         """1 batched tail model_forward + 1 batched ``compute_logits``.
 
@@ -1082,8 +1085,17 @@ class BatchedModelRunner(NPUModelRunner):
             assert batched_dp_ranks is not None, (
                 "execute_model_batched_tail: batched_dp_ranks "
                 "required for non-embedding_only edge mode.")
+            logger.info(
+                "[PD] execute_model_batched_tail: "
+                "calling _get_or_build_merged_attn_ctx "
+                "dp_ranks=%s", batched_dp_ranks)
             ctx = self._get_or_build_merged_attn_ctx(
-                bundles, batched_dp_ranks)
+                bundles, batched_dp_ranks,
+                pp_send_work_by_channel=pp_send_work_by_channel)
+            logger.info(
+                "[PD] execute_model_batched_tail: "
+                "_get_or_build_merged_attn_ctx done "
+                "dp_ranks=%s", batched_dp_ranks)
             tail_attn_metadata: Any = ctx.merged_attn_metadata
             batch_descriptor = ctx.merged_batch_descriptor
             cudagraph_mode = ctx.merged_cudagraph_mode
@@ -1181,6 +1193,10 @@ class BatchedModelRunner(NPUModelRunner):
         kv_connector_output = None
         num_tokens_merged = sum(n_actuals_tail)
         num_tokens_across_dp_merged = None
+        logger.info(
+            "[PD] execute_model_batched_tail: "
+            "calling _model_forward num_tokens=%d cudagraph=%s",
+            num_tokens_padded_merged, cudagraph_mode)
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -1219,6 +1235,9 @@ class BatchedModelRunner(NPUModelRunner):
                      and ctx.merged_inputs_embeds is not None)
                  else any_bundle.inputs_embeds),
             )
+        logger.info(
+            "[PD] execute_model_batched_tail: "
+            "_model_forward returned")
 
         merged_sample_hidden_states = (
             hidden_states[merged_logits_indices])
@@ -1543,6 +1562,7 @@ class BatchedModelRunner(NPUModelRunner):
         self,
         bundles: list["_ExecuteModelBundle"],
         batched_dp_ranks: list[int],
+        pp_send_work_by_channel: dict | None = None,
     ) -> "_MergedAttnContext":
         """Build (or reuse cached) merged per-layer attn state.
 
@@ -1560,7 +1580,14 @@ class BatchedModelRunner(NPUModelRunner):
         """
         cached = getattr(self, "_merged_attn_ctx_cache", None)
         if cached is not None:
+            logger.info(
+                "[PD] _get_or_build_merged_attn_ctx: "
+                "REUSING cached ctx")
             return cached
+
+        logger.info(
+            "[PD] _get_or_build_merged_attn_ctx: "
+            "BUILDING new ctx dp_ranks=%s", batched_dp_ranks)
 
         per_dp_offsets = getattr(self, "_per_dp_offsets", None)
         if per_dp_offsets is None:
@@ -1584,6 +1611,7 @@ class BatchedModelRunner(NPUModelRunner):
             cm = b.common_attn_metadata
             cms_unpadded.append(
                 cm.unpadded(cm.num_actual_tokens, b.num_reqs_actual))
+        logger.info("[PD] _get_or_build_merged_attn_ctx: Step 0 unpad done n_unpadded=%d", len(cms_unpadded))
 
         # ---- Step 1: merged scalars + ``attn_state`` unification.
         merged_num_actual_tokens = sum(
@@ -1609,6 +1637,7 @@ class BatchedModelRunner(NPUModelRunner):
             merged_attn_state = AscendAttentionState.ChunkedPrefill
         else:
             merged_attn_state = next(iter(unique_states))
+        logger.info("[PD] _get_or_build_merged_attn_ctx: Step 1 scalars done merged_num_actual_tokens=%d merged_num_reqs=%d", merged_num_actual_tokens, merged_num_reqs)
 
         # ---- Step 2: dispatch the merged batch to get the merged
         # padded sizes and the merged ``CUDAGraphMode``. The merged
@@ -1646,6 +1675,8 @@ class BatchedModelRunner(NPUModelRunner):
                 else merged_num_reqs)
             merged_num_tokens_padded = (
                 merged_batch_descriptor.num_tokens)
+        logger.info("[PD] _get_or_build_merged_attn_ctx: Step 2 dispatch done mode=%s num_tokens_padded=%d", merged_cudagraph_mode, merged_num_tokens_padded)
+        logger.info("[PD] _get_or_build_merged_attn_ctx: _pp_send_work_by_channel=%s", pp_send_work_by_channel)
 
         # ---- Step 3: merged cu_seqlen (``query_start_loc`` /
         # ``query_start_loc_cpu``). Unpad → cumsum-merge → pad to
@@ -1662,6 +1693,7 @@ class BatchedModelRunner(NPUModelRunner):
                 merged_qsl_cpu_list.append(merged_qsl_cpu_list[-1])
         merged_query_start_loc_cpu = torch.tensor(
             merged_qsl_cpu_list, dtype=torch.int32, device="cpu")
+
         if (merged_query_start_loc_cpu.shape[0] - 1
                 < merged_num_reqs_padded):
             last = merged_query_start_loc_cpu[-1].item()
@@ -1670,7 +1702,7 @@ class BatchedModelRunner(NPUModelRunner):
             else:
                 pad = torch.full(
                     (merged_num_reqs_padded + 1
-                    - merged_query_start_loc_cpu.shape[0],),
+                     - merged_query_start_loc_cpu.shape[0],),
                     last, dtype=torch.int32, device="cpu")
             merged_query_start_loc_cpu = torch.cat(
                 [merged_query_start_loc_cpu, pad])
@@ -1678,8 +1710,11 @@ class BatchedModelRunner(NPUModelRunner):
               > merged_num_reqs_padded):
             merged_query_start_loc_cpu = merged_query_start_loc_cpu[
                 :merged_num_reqs_padded + 1]
+
         merged_query_start_loc = merged_query_start_loc_cpu.to(
             self.device)
+        logger.info("[PD] _get_or_build_merged_attn_ctx: Step 3 cu_seqlen done query_start_length=%d", len(merged_qsl_cpu_list))
+        logger.info("[PD] _get_or_build_merged_attn_ctx: _pp_send_work_by_channel=%s", pp_send_work_by_channel)
         # The FULL mode buffer copy happens AFTER the
         # decode-first reorder (further down) so the buffer
         # reflects the reordered (decode-first) layout the
@@ -1768,6 +1803,11 @@ class BatchedModelRunner(NPUModelRunner):
         # downstream permute calls below stay uniform.
         need_reorder = (
             merged_attn_state != AscendAttentionState.DecodeOnly)
+        logger.info(
+            "[PD] _get_or_build_merged_attn_ctx: "
+            "calling _apply_decode_first_reorder "
+            "need_reorder=%s merged_num_reqs=%d merged_num_reqs_padded=%d",
+            need_reorder, merged_num_reqs, merged_num_reqs_padded)
         (
             merged_query_start_loc_cpu,
             merged_query_start_loc,
@@ -1836,6 +1876,11 @@ class BatchedModelRunner(NPUModelRunner):
             merged_query_start_loc = (
                 self.query_start_loc.gpu[
                     :merged_num_reqs_padded + 1])
+        logger.info(
+            "[PD] _get_or_build_merged_attn_ctx: "
+            "decode_reorder+FULL_buffers done, "
+            "cudagraph_mode=%s",
+            merged_cudagraph_mode)
 
         # ``positions`` / ``positions_cpu`` (DSA): ``unpadded``
         # keeps them full-length; slice to
@@ -1936,12 +1981,25 @@ class BatchedModelRunner(NPUModelRunner):
                 merged_query_start_loc_cpu[1:].tolist())
         else:
             merged_actual_seq_lengths_q = None
+        logger.info(
+            "[PD] _get_or_build_merged_attn_ctx: "
+            "positions+actual_seq_lengths merged, "
+            "entering Step 5")
 
         # ---- Step 5: per-(kv_cache_gid, attn_gid) build.
         merged_attn_metadata: dict = {}
         from vllm.v1.attention.backends.gdn_attn import (
             GDNAttentionMetadataBuilder,
         )
+        logger.info(
+            "[PD] _get_or_build_merged_attn_ctx: "
+            "entering Step 5 per-layer build "
+            "kv_gids=%d merged_num_reqs=%d merged_num_tokens=%d "
+            "merged_num_reqs_padded=%d merged_num_tokens_padded=%d "
+            "cudagraph_mode=%s",
+            num_kv_cache_gids, merged_num_reqs,
+            merged_num_actual_tokens, merged_num_reqs_padded,
+            merged_num_tokens_padded, merged_cudagraph_mode)
         for kv_cache_gid in range(num_kv_cache_gids):
             for attn_gid in range(
                     len(self.attn_groups[kv_cache_gid])):
@@ -1959,6 +2017,11 @@ class BatchedModelRunner(NPUModelRunner):
                 # ``kv_cache_gid > 0``). Unpad to actual
                 # num_reqs_actual, remap+cat, pad to
                 # ``merged_num_reqs_padded``.
+                logger.info(
+                    "[PD] _get_or_build_merged_attn_ctx: "
+                    "Step 5 block_table remap kv_gid=%d attn_gid=%d "
+                    "dp_ranks=%s",
+                    kv_cache_gid, attn_gid, batched_dp_ranks)
                 parts_bt = []
                 for cm_unpadded, b, k in zip(
                         cms_unpadded, bundles, batched_dp_ranks):
@@ -2265,6 +2328,10 @@ class BatchedModelRunner(NPUModelRunner):
                             # first non-None value (defensive).
                             merged_extra_args.setdefault(k_key, v)
 
+                logger.info(
+                    "[PD] _get_or_build_merged_attn_ctx: "
+                    "Step 5 builder.build kv_gid=%d attn_gid=%d",
+                    kv_cache_gid, attn_gid)
                 attn_metadata_i = builder.build(
                     common_prefix_len=merged_cascade_attn_prefix_len,
                     common_attn_metadata=cm_merged,
@@ -2412,6 +2479,9 @@ class BatchedModelRunner(NPUModelRunner):
             merged_token_perm=merged_token_perm,
             inv_merged_token_perm=inv_merged_token_perm,
         )
+        logger.info(
+            "[PD] _get_or_build_merged_attn_ctx: "
+            "DONE, caching ctx")
         self._merged_attn_ctx_cache = ctx
         return ctx
 

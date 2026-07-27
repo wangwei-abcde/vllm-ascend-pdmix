@@ -361,12 +361,35 @@ def init_ascend_model_parallel(
 
         # Phase6 hidden data-plane channels are still required in edge-cloud
         # mode.  The default PP group is PREFILL_1, the alternate PP group is
-        # DECODE, and the extra hidden-channel group is PREFILL_2.
+        # DECODE_1, and extra hidden-channel groups are created for
+        # PREFILL_2..N and DECODE_2..M when dp_size > 1.
         pp_group = get_pp_group()
         if pp_group.world_size > 1:
             pp_group.create_alternate_groups(backend)
             if hasattr(pp_group, "create_hidden_channel_groups"):
-                pp_group.create_hidden_channel_groups(backend)
+                dp_size = parallel_config.data_parallel_size
+                # Create extra hidden-channel groups based on dp_size.
+                if parallel_config.is_shared_model_edge:
+                    num_prefill = dp_size * 2
+                    num_decode = dp_size
+                else:
+                    num_prefill = 2
+                    num_decode = 1
+                logger.info(
+                    "[PD] create_hidden_channel_groups: "
+                    "dp_size=%s dp_rank=%s num_prefill=%s num_decode=%s, "
+                    "edge_npu_count=%s",
+                    dp_size,
+                    getattr(parallel_config, "data_parallel_rank", 0),
+                    num_prefill, num_decode,
+                    edge_npu_count,
+                )
+                HiddenChannelType.init(dp_size=num_decode)
+                pp_group.create_hidden_channel_groups(
+                    backend, num_prefill, num_decode,
+                )
+            else:
+                HiddenChannelType.init(dp_size=1)
 
         # Ascend-specific groups that are currently disabled by default
         # in edge-cloud mode. If enabled in the future, they must follow
@@ -573,7 +596,7 @@ def init_ascend_model_parallel(
     # Create alternate PP groups for dual-channel communication.
     # Primary (device_group/cpu_group): used for non-ALL_DECODE batches
     #   (ALL_PREFILL + PREFILL_DECODE_MIXED).
-    # Alternate (alt_device_group/alt_cpu_group): used for ALL_DECODE batches.
+    # Alternate (DECODE_1 via _decode_device_groups[0]): used for ALL_DECODE.
     # Both groups cover the same PP ranks but are independent ProcessGroup
     # instances, allowing the HCCL backend to maintain separate communication
     # streams and avoid head-of-line blocking between decode and
@@ -583,7 +606,10 @@ def init_ascend_model_parallel(
         backend = torch.distributed.get_backend(get_world_group().device_group)
         pp_group.create_alternate_groups(backend)
         if hasattr(pp_group, "create_hidden_channel_groups"):
-            pp_group.create_hidden_channel_groups(backend)
+            HiddenChannelType.init(dp_size=1)
+            pp_group.create_hidden_channel_groups(
+                backend, num_prefill=2, num_decode=1,
+            )
 
 
 def model_parallel_initialized():
@@ -772,6 +798,13 @@ def edge_cloud_isend_tensor_dict(
 
     group = _get_edge_cloud_hidden_channel_device_group(
         pp_group, channel=channel, use_alt_group=use_alt_group
+    )
+
+    logger.info(
+        "[PD] edge_cloud_isend: channel=%s dst=%s num_tokens=%s tensor_keys=%s",
+        channel.value if channel else "default",
+        dst, num_tokens,
+        [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor) and v.numel() > 0],
     )
 
     # Guard against silent key/order drift between sender and receiver.
@@ -1203,6 +1236,13 @@ def edge_cloud_broadcast_recv(
     tp_group = get_tp_group()
     is_pp_npu0 = pp_group.world_size > 1
     ec_meta = _select_edge_cloud_meta_for_recv()
+
+    logger.info(
+        "[PD] edge_cloud_broadcast_recv: channel=%s num_tokens=%s src=%s "
+        "pp_world=%d is_pp_npu0=%s",
+        channel.value, num_tokens, src,
+        pp_group.world_size, is_pp_npu0,
+    )
 
     if is_pp_npu0:
         tensor_dict, comm_handles, comm_postprocess = (
