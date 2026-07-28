@@ -651,6 +651,24 @@ class NPUWorker(WorkerBase):
             _gathered = self._all_gather_tensor_dict(output.tensors)
         else:
             _gathered = output.tensors
+        _head_rank = getattr(self.model_runner, "dp_rank", "?")
+        _head_ht = getattr(scheduler_output, "head_token", "?")
+        _head_bt = scheduler_output.batch_type
+        _head_shapes: dict[str, tuple] = {}
+        _head_sum: dict[str, float] = {}
+        for _k, _v in sorted(_gathered.items()):
+            if isinstance(_v, torch.Tensor):
+                _head_shapes[_k] = tuple(_v.shape)
+                if _v.numel() > 0:
+                    _head_sum[_k] = float(_v.ravel()[:min(4, _v.numel())].sum().cpu().item())
+        logger.error(
+            "[FP-EDGE-HEAD-GATHERED] dp_rank=%s bt=%s head_token=%s tokens=%s shapes=%s head_sum=%s",
+            _head_rank, _head_bt.name, _head_ht,
+            scheduler_output.total_num_scheduled_tokens,
+            _head_shapes, _head_sum,
+        )
+        import sys as _head_sys
+        _head_sys.stderr.flush()
         if get_pp_group().world_size == 2:
             channel = self._hidden_channel_for(scheduler_output)
             # [FINGERPRINT] Log edge head send for cross-check with cloud recv
@@ -774,6 +792,20 @@ class NPUWorker(WorkerBase):
             comm_handles=comm_handles,
             comm_postprocess=comm_postprocess,
         )
+        _tail_rank = getattr(self.model_runner, "dp_rank", "?")
+        _tail_ht = getattr(scheduler_output, "head_token", "?")
+        _tail_shapes: dict[str, tuple] = {}
+        for _k, _v in sorted(intermediate_tensors.tensors.items()):
+            if isinstance(_v, torch.Tensor):
+                _tail_shapes[_k] = tuple(_v.shape)
+        logger.error(
+            "[FP-EDGE-TAIL-RECV] dp_rank=%s bt=%s head_token=%s tokens=%s ch=%s shapes=%s",
+            _tail_rank, scheduler_output.batch_type.name, _tail_ht,
+            scheduler_output.total_num_scheduled_tokens,
+            channel.value, _tail_shapes,
+        )
+        import sys as _tail_sys
+        _tail_sys.stderr.flush()
 
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors,
