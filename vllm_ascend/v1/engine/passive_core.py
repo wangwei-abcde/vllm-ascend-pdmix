@@ -515,7 +515,9 @@ class PassiveEngineCoreProc:
                 ):
                     continue
 
-                if result.get("batch_type") != BatchType.PREFILL_FIRST:
+                if result.get("batch_type") not in (
+                    BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST
+                ):
                     continue
                 head_token = result.get("head_token")
                 if not head_token or head_token in self._published_post_out_tokens:
@@ -610,12 +612,19 @@ class PassiveEngineCoreProc:
             # DP via zmq) has no real tail to return; skip POST_OUT so the
             # edge does not expect a DECODE_LAST for it.
             if batch.scheduler_output.total_num_scheduled_tokens > 0:
-                if batch.scheduler_output.batch_type == BatchType.DECODE_FIRST:
-                    self._maybe_publish_post_out(batch.scheduler_output)
-                elif (
-                    batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
-                    and (slice_info is None or slice_info.is_last_slice)
+                if (
+                    batch.scheduler_output.batch_type == BatchType.DECODE_FIRST
+                    or (
+                        batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
+                        and (slice_info is None or slice_info.is_last_slice)
+                    )
                 ):
+                    # Defer POST_OUT (DECODE_LAST / PREFILL_LAST) until the
+                    # cloud worker has finished executing the middle segment.
+                    # Publishing immediately (before the worker completes) can
+                    # cause the edge to issue irecv and match stale isend data,
+                    # leading to cross-DP deadlock on A2-A3 where MC2 alltoall
+                    # delays the cloud worker.
                     head_token = getattr(batch.scheduler_output, "head_token", None)
                     if head_token:
                         self._pending_post_out_by_head_token[head_token] = (
