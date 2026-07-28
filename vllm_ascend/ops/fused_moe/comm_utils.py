@@ -108,6 +108,12 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None):
         torch.Tensor: Gathered tensor.
     """
     world_size = torch.distributed.get_world_size(group)
+    from vllm.logger import logger as _ag_logger
+    import sys as _ag_sys
+    _ag_rank = torch.distributed.get_rank()
+    _ag_logger.error("[HANG] _gather_along_first_dim ENTER: rank=%s ws=%s sizes=%s",
+                     _ag_rank, world_size, output_split_sizes)
+    _ag_sys.stderr.flush()
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
@@ -116,14 +122,26 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None):
     if output_split_sizes is None:
         dim_size[0] = dim_size[0] * world_size
 
+        _ag_logger.error("[HANG] _gather_along_first_dim alloc: rank=%s dim_size=%s dtype=%s",
+                         _ag_rank, dim_size, input_.dtype)
+        _ag_sys.stderr.flush()
         output = torch.empty(dim_size, dtype=input_.dtype, device=torch.npu.current_device())
-        torch.distributed.all_gather_into_tensor(output, input_.contiguous(), group=group)
+        _ag_logger.error("[HANG] _gather_along_first_dim contigu: rank=%s", _ag_rank)
+        _ag_sys.stderr.flush()
+        _input_contiguous = input_.contiguous()
+        _ag_logger.error("[HANG] _gather_along_first_dim ag ENTER: rank=%s", _ag_rank)
+        _ag_sys.stderr.flush()
+        torch.distributed.all_gather_into_tensor(output, _input_contiguous, group=group)
+        _ag_logger.error("[HANG] _gather_along_first_dim ag EXIT: rank=%s", _ag_rank)
+        _ag_sys.stderr.flush()
     else:
         dim_size[0] = sum(output_split_sizes)
         output = torch.empty(dim_size, dtype=input_.dtype, device=torch.npu.current_device())
         output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
         torch.distributed.all_gather(output_tensor_list, input_, group=group)
 
+    _ag_logger.error("[HANG] _gather_along_first_dim EXIT: rank=%s", _ag_rank)
+    _ag_sys.stderr.flush()
     return output
 
 

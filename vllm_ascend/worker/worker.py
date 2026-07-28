@@ -569,7 +569,14 @@ class NPUWorker(WorkerBase):
                 BatchType.PREFILL_LAST,
                 BatchType.DECODE_LAST,
             ):
-                self._wait_pp_send_work(self._hidden_channel_for(scheduler_output))
+                ch = self._hidden_channel_for(scheduler_output)
+                pending = len(self._pp_send_work_by_channel.get(ch.value, []))
+                _hang_dp = getattr(self.model_runner, "dp_rank", "?")
+                logger.error("[HANG] WAIT_PP_SEND: dp_rank=%s bt=%s ch=%s pending_handles=%s",
+                            _hang_dp, bt.value, ch.value, pending)
+                self._wait_pp_send_work(ch)
+                logger.error("[HANG] WAIT_PP_SEND done: dp_rank=%s bt=%s ch=%s",
+                            _hang_dp, bt.value, ch.value)
             else:
                 self._wait_pp_send_work()
         else:

@@ -245,7 +245,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         )
         _hang_logger.error("[HANG] moe dispatch EXIT: ep_rank=%s", _hang_ep)
         _hang_sys.stderr.flush()
-        # comm_stream.wait_stream(torch.npu.current_stream())
+
         (
             expand_x,
             dynamic_scale,
@@ -342,12 +342,21 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
     def token_combine(self, hidden_states, combine_metadata, bias=None):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
 
+        from vllm.logger import logger as _hang_logger
+        import sys as _hang_sys
+        _hang_ep = get_ep_group().rank_in_group
+        _hang_logger.error("[HANG] moe MC2 combine ENTER: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
+
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states, combine_metadata)
         combined_output = (
             torch_npu.npu_moe_distribute_combine_v2(**kwargs_mc2)
             if self.enable_dispatch_v2
             else torch_npu.npu_moe_distribute_combine(**kwargs_mc2)
         )
+
+        _hang_logger.error("[HANG] moe MC2 combine EXIT: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
 
         return combined_output
 
@@ -494,6 +503,16 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             hidden_shape_before_permute,
         ) = self._dispatch_preprocess(hidden_states, topk_ids)
 
+        from vllm.logger import logger as _hang_logger
+        import sys as _hang_sys
+        _hang_ep = get_ep_group().rank_in_group
+        _hang_logger.error("[HANG] token_dispatch post_dispatch_preprocess: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
+
+        _hang_logger.error("[HANG] ALLTOALL splits: ep_rank=%s input_splits=%s output_splits=%s",
+                          _hang_ep, list(input_splits), list(output_splits))
+        _hang_sys.stderr.flush()
+
         dynamic_scale_after_all2all = None
         if with_quant:
             permutated_local_input_tokens, dynamic_scale = torch_npu.npu_dynamic_quant(permutated_local_input_tokens)
@@ -503,10 +522,14 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             permute2_ep_all_to_all_handle.wait()
             dynamic_scale.untyped_storage().resize_(0)
 
+        _hang_logger.error("[HANG] ALLTOALL dispatch a2a ENTER: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
         _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
             permutated_local_input_tokens, output_splits, input_splits, self.ep_group
         )
         permute1_ep_all_to_all_handle.wait()
+        _hang_logger.error("[HANG] ALLTOALL dispatch a2a EXIT: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
         permutated_local_input_tokens.untyped_storage().resize_(0)
 
         # Postprocess
@@ -542,6 +565,11 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         hidden_states = self._combine_preprocess(hidden_states, combine_metadata)
 
         # 2. AllToAll
+        from vllm.logger import logger as _hang_logger
+        import sys as _hang_sys
+        _hang_ep = get_ep_group().rank_in_group
+        _hang_logger.error("[HANG] ALLTOALL combine a2a ENTER: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
         _, permutated_local_input_tokens, handle = async_all_to_all(
             hidden_states,
             combine_metadata.input_splits,
@@ -549,6 +577,8 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             self.ep_group,
         )
         handle.wait()
+        _hang_logger.error("[HANG] ALLTOALL combine a2a EXIT: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
         hidden_states.untyped_storage().resize_(0)
 
         # 3. Postprocess using metadata
@@ -574,6 +604,12 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             num_out_tokens=num_out_tokens,
         )
 
+        from vllm.logger import logger as _hang_logger
+        import sys as _hang_sys
+        _hang_ep = get_ep_group().rank_in_group
+        _hang_logger.error("[HANG] _dispatch_preprocess RETURN: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
+
         return (
             permutated_local_input_tokens,
             reversed_local_input_permutation_mapping,
@@ -598,29 +634,60 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             .numpy()
         )
 
+        from vllm.logger import logger as _hang_logger
+        import sys as _hang_sys
+        _hang_ep = get_ep_group().rank_in_group
+        _hang_logger.error("[HANG] EP_ALLGATHER ENTER: ep_rank=%s tokens=%s",
+                          _hang_ep, num_out_tokens)
+        _hang_sys.stderr.flush()
+        _hang_logger.error("[HANG] EP_ALLGATHER canary ENTER: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
         num_global_tokens_per_expert = gather_from_sequence_parallel_region(
             num_local_tokens_per_expert, group=self.ep_group
         ).reshape(ep_size, self.num_experts)
+        _hang_logger.error("[HANG] EP_ALLGATHER canary2 EXIT: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
+        _hang_logger.error("[HANG] EP_ALLGATHER EXIT: ep_rank=%s",
+                          _hang_ep)
+        _hang_sys.stderr.flush()
         num_global_tokens_per_local_expert = num_global_tokens_per_expert[
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
         ]
+        _hang_logger.error("[HANG] EP_ALLGATHER post_slice: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
         if num_global_tokens_per_local_expert is None:
             raise ValueError("num_global_tokens_per_local_expert must be set before sum.")
 
         output_splits = (
             num_global_tokens_per_local_expert.sum(axis=-1).to(torch.device("cpu"), non_blocking=True).numpy()
         )
+        _hang_logger.error("[HANG] EP_ALLGATHER post_output_splits: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
         num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(axis=0)
 
         global_input_tokens_local_experts_indices = None
+        _hang_logger.error("[HANG] EP_ALLGATHER pre_sync_or_repeat: ep_rank=%s num_local_experts=%s",
+                          _hang_ep, self.num_local_experts)
+        _hang_sys.stderr.flush()
         if self.num_local_experts > 1:
             if num_global_tokens_per_local_expert is None:
                 raise ValueError("num_global_tokens_per_local_expert must be set before operations.")
+            _hang_logger.error("[HANG] EP_ALLGATHER repeat_interleave ENTER: ep_rank=%s ravel_size=%s",
+                              _hang_ep, list(num_global_tokens_per_local_expert.ravel().shape))
+            _hang_sys.stderr.flush()
             global_input_tokens_local_experts_indices = torch.repeat_interleave(
                 self.expert_ids_per_ep_rank, num_global_tokens_per_local_expert.ravel()
             )
+            _hang_logger.error("[HANG] EP_ALLGATHER repeat_interleave EXIT: ep_rank=%s", _hang_ep)
+            _hang_sys.stderr.flush()
         else:
+            _hang_logger.error("[HANG] EP_ALLGATHER npu_sync ENTER: ep_rank=%s", _hang_ep)
+            _hang_sys.stderr.flush()
             torch.npu.synchronize()
+            _hang_logger.error("[HANG] EP_ALLGATHER npu_sync EXIT: ep_rank=%s", _hang_ep)
+            _hang_sys.stderr.flush()
+        _hang_logger.error("[HANG] EP_ALLGATHER post_sync_or_repeat: ep_rank=%s", _hang_ep)
+        _hang_sys.stderr.flush()
 
         return (
             num_tokens_per_local_expert,

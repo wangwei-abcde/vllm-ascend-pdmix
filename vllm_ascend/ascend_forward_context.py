@@ -230,6 +230,9 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
+_MOE_COMM_SELECTION_COUNT = 0
+
+
 def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
@@ -261,6 +264,18 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         return None
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     soc_version = get_ascend_device_type()
+    # [HANG-DIAG] track MoE comm type selection across all warmup + real forwards
+    global _MOE_COMM_SELECTION_COUNT
+    _MOE_COMM_SELECTION_COUNT += 1
+    import logging as _moe_logging
+    import sys as _moe_sys
+    import torch.distributed as _moe_dist
+    _moe_rank = _moe_dist.get_rank() if _moe_dist.is_initialized() else -1
+    _moe_logging.getLogger("vllm").error(
+        "[HANG] select_moe_comm_method #%s: rank=%s num_tokens=%s capacity=%s soc=%s",
+        _MOE_COMM_SELECTION_COUNT, _moe_rank, num_tokens, mc2_tokens_capacity, soc_version,
+    )
+    _moe_sys.stderr.flush()
     quant_type = getattr(
         vllm_config.model_config.hf_text_config,
         "moe_quantize",
@@ -316,6 +331,11 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             moe_comm_type = MoECommType.ALLTOALL
     else:
         raise ValueError(f"Unsupported soc_version: {soc_version}")
+    _moe_logging.getLogger("vllm").error(
+        "[HANG] select_moe_comm_method #%s: rank=%s result=%s (0=AG 1=MC2 2=A2A 3=F_MC2)",
+        _MOE_COMM_SELECTION_COUNT, _moe_rank, moe_comm_type.value if moe_comm_type else -1,
+    )
+    _moe_sys.stderr.flush()
     return moe_comm_type
 
 

@@ -580,7 +580,7 @@ class AscendFusedMoE(FusedMoE):
         # / AllGather / FusedMC2, which all route through here). Used to detect
         # cross-DP divergence between cloud DPs. Compare rank1 (dp0 cloud) vs
         # rank6 (dp1 cloud) count sequences.
-        dpdbg_moe_a2a_tick("moe_fwd")
+        dpdbg_moe_a2a_tick("moe_fwd_layer_%s" % self.layer_id)
         self.ensure_moe_quant_config_init()
         return self.runner.forward(
             hidden_states,
@@ -646,6 +646,7 @@ class AscendFusedMoE(FusedMoE):
 
                 set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
+        dpdbg_moe_a2a_tick("before_prepare_layer_%s" % self.layer_id)
         prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -653,6 +654,7 @@ class AscendFusedMoE(FusedMoE):
             enable_shared_expert_dp=self.enable_shared_expert_dp,
             quant_type=self.quant_type,
         )
+        dpdbg_moe_a2a_tick("after_prepare")
         hidden_states = prepare_output.hidden_states
         router_logits = prepare_output.router_logits
         mc2_mask = prepare_output.mc2_mask
@@ -664,6 +666,7 @@ class AscendFusedMoE(FusedMoE):
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
 
         # Matrix multiply.
+        dpdbg_moe_a2a_tick("before_fused_experts")
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -688,6 +691,8 @@ class AscendFusedMoE(FusedMoE):
             mc2_mask=mc2_mask,
         )
 
+        dpdbg_moe_a2a_tick("after_fused_experts")
+
         if self.dynamic_eplb:
             expert_tokens = fused_experts_results.expert_tokens
             group_list_type = fused_experts_results.group_list_type
@@ -708,11 +713,13 @@ class AscendFusedMoE(FusedMoE):
             else:
                 self.moe_load.add_(local_load)
 
+        dpdbg_moe_a2a_tick("before_finalize")
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,
             reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
             padded_hidden_states_shape=padded_hidden_states_shape,
         )
+        dpdbg_moe_a2a_tick("after_finalize_layer_%s" % self.layer_id)
 
         if return_with_event:
             return FusedMoEResult(
