@@ -653,6 +653,22 @@ class NPUWorker(WorkerBase):
             _gathered = output.tensors
         if get_pp_group().world_size == 2:
             channel = self._hidden_channel_for(scheduler_output)
+            # [FINGERPRINT] Log edge head send for cross-check with cloud recv
+            _edge_send_fp_shapes: dict[str, tuple] = {}
+            _edge_send_fp_head: dict[str, float] = {}
+            for _k, _v in sorted(_gathered.items()):
+                if isinstance(_v, torch.Tensor):
+                    _edge_send_fp_shapes[_k] = tuple(_v.shape)
+                    if _v.numel() > 0:
+                        _edge_send_fp_head[_k] = float(_v.ravel()[:min(4, _v.numel())].sum().cpu().item())
+            logger.error(
+                "[FP-EDGE-SEND] dp_rank=%s ch=%s num_tokens=%s head_token=%s shapes=%s head_sum=%s",
+                self.model_runner.dp_rank, channel.value,
+                scheduler_output.total_num_scheduled_tokens,
+                getattr(scheduler_output, "head_token", "?"),
+                _edge_send_fp_shapes,
+                _edge_send_fp_head,
+            )
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
                                             num_tokens=scheduler_output.total_num_scheduled_tokens),
@@ -725,6 +741,20 @@ class NPUWorker(WorkerBase):
         logger.error("[HANG] edge tail recv EXIT: dp_rank=%s channel=%s",
                     _hang_tail_rank, channel.value)
         _hang_sys.stderr.flush()
+        # [FINGERPRINT] Log recv metadata for cross-check with cloud isend.
+        # NOTE: tensor data is not ready yet (irecv async), so use metadata
+        # (head_token + num_tokens + shapes) as the fingerprint.
+        _recv_fp_shapes: dict[str, tuple] = {}
+        for _k, _v in sorted(tensor_dict.items()):
+            if isinstance(_v, torch.Tensor):
+                _recv_fp_shapes[_k] = tuple(_v.shape)
+        logger.error(
+            "[FP-RECV] dp_rank=%s ch=%s num_tokens=%s head_token=%s shapes=%s",
+            _hang_tail_rank, channel.value,
+            scheduler_output.total_num_scheduled_tokens,
+            getattr(scheduler_output, "head_token", "?"),
+            _recv_fp_shapes,
+        )
         logger.error(
             "[PP-EVT] RECV dp_rank=%s bt=%s ht=%s ch=%s tokens=%s",
             _hang_tail_rank, scheduler_output.batch_type.value,
@@ -844,6 +874,18 @@ class NPUWorker(WorkerBase):
                 _hang_cld_rank, channel.value,
             )
             _hang_sys.stderr.flush()
+            # [FINGERPRINT] Log cloud recv metadata for cross-check with edge head send
+            _cloud_recv_fp_shapes: dict[str, tuple] = {}
+            for _k, _v in sorted(tensor_dict.items()):
+                if isinstance(_v, torch.Tensor):
+                    _cloud_recv_fp_shapes[_k] = tuple(_v.shape)
+            logger.error(
+                "[FP-CLOUD-RECV] dp_rank=%s ch=%s num_tokens=%s head_token=%s shapes=%s",
+                _hang_cld_rank, channel.value,
+                scheduler_output.total_num_scheduled_tokens,
+                getattr(scheduler_output, "head_token", "?"),
+                _cloud_recv_fp_shapes,
+            )
             logger.error(
                 "[PP-EVT] CLOUD-RECV dp_rank=%s bt=%s ht=%s ch=%s tokens=%s",
                 _hang_cld_rank, scheduler_output.batch_type.value,
@@ -901,6 +943,22 @@ class NPUWorker(WorkerBase):
         if get_pp_group().world_size > 1:
             channel = self._hidden_channel_for(scheduler_output)
             _hang_ret_rank = getattr(self.model_runner, "dp_rank", "?")
+            # [FINGERPRINT] Log send tensor metadata for cross-check with edge recv
+            _send_fp_shapes: dict[str, tuple] = {}
+            _send_fp_head: dict[str, float] = {}
+            for _k, _v in sorted(_gathered.items()):
+                if isinstance(_v, torch.Tensor):
+                    _send_fp_shapes[_k] = tuple(_v.shape)
+                    if _v.numel() > 0:
+                        _send_fp_head[_k] = float(_v.ravel()[:min(4, _v.numel())].sum().cpu().item())
+            logger.error(
+                "[FP-SEND] dp_rank=%s ch=%s num_tokens=%s head_token=%s shapes=%s head_sum=%s",
+                _hang_ret_rank, channel.value,
+                scheduler_output.total_num_scheduled_tokens,
+                getattr(scheduler_output, "head_token", "?"),
+                _send_fp_shapes,
+                _send_fp_head,
+            )
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
                                             num_tokens=scheduler_output.total_num_scheduled_tokens,
