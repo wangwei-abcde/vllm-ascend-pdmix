@@ -936,6 +936,20 @@ class NPUWorker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
+            # [DIAG-CLOUD] Verify irecv hidden_states has actually arrived.
+            # handle.wait() only inserts stream dependency (event.block);
+            # on A3 DPU path the HCCL event may fire before the data is
+            # physically in the recv buffer.  Accessing .tensors triggers
+            # wait_for_comm(), then .cpu().item() forces a device sync.
+            if comm_handles:
+                _diag_cl_rank = getattr(self.model_runner, "dp_rank", "?")
+                for _k, _v in intermediate_tensors.tensors.items():
+                    if isinstance(_v, torch.Tensor) and _v.numel() > 0:
+                        _diag_first = float(_v.ravel()[0].cpu().item())
+                        logger.error(
+                            "[DIAG-CLOUD-RECV] dp_rank=%s key=%s first_val=%.4f OK",
+                            _diag_cl_rank, _k, _diag_first)
+                        break
 
         if self.profiler is not None:
             self.profiler.step()
