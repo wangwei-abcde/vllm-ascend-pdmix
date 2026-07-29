@@ -622,7 +622,20 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         )
 
     def _preprocess(self, topk_ids: torch.Tensor):
+        # [DIAG] Event checkpoint BEFORE histc
+        import torch_npu as _diag_ep_npu
+        from vllm.logger import logger as _diag_pp_logger
+        _diag_ev_h0 = _diag_ep_npu.npu.Event()
+        _diag_ev_h0.record()
         num_local_tokens_per_expert = torch.histc(topk_ids, bins=self.num_experts, min=0, max=self.num_experts)
+        # [DIAG] Event checkpoint AFTER histc
+        _diag_ev_h1 = _diag_ep_npu.npu.Event()
+        _diag_ev_h1.record()
+        _diag_ev_h0_done = _diag_ev_h0.query()
+        _diag_ev_h1_done = _diag_ev_h1.query()
+        _diag_ep = get_ep_group().rank_in_group
+        _diag_pp_logger.error("[DIAG-EP-CHK] after_histc: ev_h0_done=%s ev_h1_done=%s ep_rank=%s num_experts=%s",
+                              _diag_ev_h0_done, _diag_ev_h1_done, _diag_ep, self.num_experts)
 
         ep_size = self.ep_size
         num_out_tokens = topk_ids.numel()
