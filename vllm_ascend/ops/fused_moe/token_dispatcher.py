@@ -642,9 +642,21 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         _hang_sys.stderr.flush()
         _hang_logger.error("[HANG] EP_ALLGATHER canary ENTER: ep_rank=%s", _hang_ep)
         _hang_sys.stderr.flush()
+        # [DIAG] Record event BEFORE all_gather to detect stream stall
+        import torch_npu as _diag_ep_npu
+        _diag_ev_ag0 = _diag_ep_npu.npu.Event()
+        _diag_ev_ag0.record()
         num_global_tokens_per_expert = gather_from_sequence_parallel_region(
             num_local_tokens_per_expert, group=self.ep_group
         ).reshape(ep_size, self.num_experts)
+        # [DIAG] Record event AFTER all_gather; query pre-event to see if
+        # compute stream has progressed past the all_gather submission.
+        _diag_ev_ag1 = _diag_ep_npu.npu.Event()
+        _diag_ev_ag1.record()
+        _diag_ev_ag0_done = _diag_ev_ag0.query()
+        _diag_ev_ag1_done = _diag_ev_ag1.query()
+        _hang_logger.error("[DIAG-EP-CHK] after_ag: ev0_done=%s ev1_done=%s ep_rank=%s",
+                          _diag_ev_ag0_done, _diag_ev_ag1_done, _hang_ep)
         _hang_logger.error("[HANG] EP_ALLGATHER canary2 EXIT: ep_rank=%s", _hang_ep)
         _hang_sys.stderr.flush()
         _hang_logger.error("[HANG] EP_ALLGATHER EXIT: ep_rank=%s",
@@ -669,6 +681,12 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         _hang_logger.error("[HANG] EP_ALLGATHER pre_sync_or_repeat: ep_rank=%s num_local_experts=%s",
                           _hang_ep, self.num_local_experts)
         _hang_sys.stderr.flush()
+        # [DIAG] Query the pre-sync event to see if compute stream is still alive
+        _diag_ev_pre = _diag_ep_npu.npu.Event()
+        _diag_ev_pre.record()
+        _diag_ev_pre_done = _diag_ev_pre.query()
+        _hang_logger.error("[DIAG-EP-CHK] pre_sync: ev_done=%s ep_rank=%s",
+                          _diag_ev_pre_done, _hang_ep)
         if self.num_local_experts > 1:
             if num_global_tokens_per_local_expert is None:
                 raise ValueError("num_global_tokens_per_local_expert must be set before operations.")
