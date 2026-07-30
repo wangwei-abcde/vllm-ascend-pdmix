@@ -780,6 +780,15 @@ class PassiveScheduler:
     def _schedule_expect_alternation_simple(self) -> ScheduledBatch:
         """Original single-DP EEP/EED state machine (no cross-DP coord)."""
         state = self.cloud_scheduling_state
+        logger.info(
+            "[MTP-DEBUG] cloud_schedule: state=%s ready_prefills=%s "
+            "ready_drafts=%s ready_decodes=%s dp_coord_group=%s",
+            state,
+            len(self.ready_prefills),
+            len(self.ready_drafts),
+            len(self.ready_decodes),
+            self.dp_coord_group is not None,
+        )
         if state == CloudSchedulingState.EXPECT_EXECUTE_PREFILL:
             if self._active_prefill_slices:
                 self.cloud_scheduling_state = (
@@ -859,6 +868,14 @@ class PassiveScheduler:
         machine transitions, throttle, and queue popping.
         """
         decision = self._make_decision_alternation()
+        logger.info(
+            "[MTP-DEBUG] cloud_schedule_coord: local_decision=%s "
+            "ready_drafts=%s ready_decodes=%s ready_prefills=%s",
+            decision.batch_type,
+            len(self.ready_drafts),
+            len(self.ready_decodes),
+            len(self.ready_prefills),
+        )
         if decision.batch_type is not None:
             self._log_queue_state("post-local-decision")
             self._log_local_decision(decision, "post-local-decision")

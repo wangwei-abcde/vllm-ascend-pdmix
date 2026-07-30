@@ -2815,6 +2815,7 @@ class NPUModelRunner(GPUModelRunner):
         # sequence.
         if scheduler_output.batch_type == BatchType.PREFILL_LAST:
             num_rejected = [0] * num_reqs
+            valid_counts_for_log = [n for n in num_scheduled]
         elif torch.is_tensor(sampled_token_ids):
             valid_counts = (
                 (sampled_token_ids[:num_reqs] != -1).sum(dim=1).tolist()
@@ -2823,11 +2824,25 @@ class NPUModelRunner(GPUModelRunner):
                 max(n - max(int(v), 1), 0)
                 for n, v in zip(num_scheduled, valid_counts)
             ]
+            valid_counts_for_log = valid_counts
         else:
             num_rejected = [
                 max(n - max(len(s), 1), 0)
                 for n, s in zip(num_scheduled, sampled_token_ids)
             ]
+            valid_counts_for_log = [len(s) for s in sampled_token_ids]
+        logger.info(
+            "[MTP-DEBUG] stash_draft_ctx: batch_type=%s head_token=%s "
+            "num_scheduled=%s num_accepted=%s num_rejected=%s "
+            "positions_head=%s positions_tail=%s",
+            scheduler_output.batch_type,
+            scheduler_output.head_token,
+            num_scheduled,
+            valid_counts_for_log,
+            num_rejected,
+            positions[:5].cpu().tolist() if positions is not None and positions.numel() >= 5 else None,
+            positions[-5:].cpu().tolist() if positions is not None and positions.numel() >= 5 else None,
+        )
         pos_flat = positions[0] if positions.dim() == 2 else positions
         start_offsets = torch.zeros(num_reqs, dtype=torch.long)
         running = 0
@@ -3468,6 +3483,15 @@ class NPUModelRunner(GPUModelRunner):
             self._edge_prepare_cache.pop(_tail_head_token, None)
             cache = self._edge_prepare_cache_by_token.pop(
                 scheduler_output.head_token
+            )
+            logger.info(
+                "[MTP-DEBUG] fast_path cache hit: head_token=%s "
+                "cached_positions=%s cached_total_tokens=%s "
+                "batch_type=%s",
+                scheduler_output.head_token,
+                cache.get("positions"),
+                cache.get("total_num_scheduled_tokens"),
+                scheduler_output.batch_type,
             )
             # consumed: only this head_token's entry is removed; other
             # in-flight prefills' caches are preserved for 2P1D.
@@ -4360,6 +4384,19 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 num_reqs = sampler_output.sampled_token_ids.size(0)
                 num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
+                logger.info(
+                    "[MTP-DEBUG] edge_send_accepted_state: "
+                    "num_accepted_tokens=%s valid_sampled_token_count=%s "
+                    "batch_type=%s head_token=%s",
+                    num_accepted.tolist(),
+                    (
+                        self.valid_sampled_token_count_gpu.cpu().tolist()
+                        if self.valid_sampled_token_count_gpu is not None
+                        else None
+                    ),
+                    scheduler_output.batch_type,
+                    scheduler_output.head_token,
+                )
                 tensor_dict_to_send = {"num_accepted_tokens": num_accepted}
                 if (
                     self._uses_scheduled_edge_cloud_draft()
@@ -4655,6 +4692,26 @@ class NPUModelRunner(GPUModelRunner):
                 sample_rows.append(start + accepted - 1)
                 start += scheduled
 
+            logger.info(
+                "[MTP-DEBUG] cloud_reconstruct_pos: task_id=%s "
+                "draft_step_idx=%s is_prefill=%s "
+                "num_scheduled=%s accepted_counts=%s "
+                "sample_rows=%s "
+                "target_positions_head=%s target_positions_tail=%s",
+                task_id,
+                draft_step_idx,
+                state.is_prefill,
+                state.num_scheduled_tokens,
+                accepted_counts,
+                sample_rows,
+                target_positions[:5].cpu().tolist()
+                if target_positions.numel() >= 5
+                else None,
+                target_positions[-5:].cpu().tolist()
+                if target_positions.numel() >= 5
+                else None,
+            )
+
             row_indices = torch.tensor(
                 sample_rows,
                 dtype=torch.long,
@@ -4864,6 +4921,20 @@ class NPUModelRunner(GPUModelRunner):
         num_accepted = num_accepted.to(self.device)
         num_reqs = num_accepted.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
+
+        logger.info(
+            "[MTP-DEBUG] cloud_apply_accepted_state: "
+            "num_accepted_tokens=%s valid_sampled_token_count=%s "
+            "batch_type=%s task_id=%s",
+            num_accepted.cpu().tolist(),
+            (
+                valid_sampled_token_count.cpu().tolist()
+                if valid_sampled_token_count is not None
+                else None
+            ),
+            scheduler_output.batch_type,
+            getattr(scheduler_output, "draft_task_id", None),
+        )
 
         if valid_sampled_token_count is not None:
             self.valid_sampled_token_count_gpu = (
