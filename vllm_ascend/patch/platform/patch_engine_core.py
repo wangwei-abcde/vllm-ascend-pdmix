@@ -356,6 +356,11 @@ def _advance_edge_cloud_draft(
     enqueue_draft_first = getattr(
         self.scheduler, "enqueue_draft_first", None
     )
+    logger.error(
+        "[MTP-DEBUG] advance_draft: has_method=%s batch_type=%s",
+        enqueue_draft_first is not None,
+        completed_scheduler_output.batch_type,
+    )
     if enqueue_draft_first is None:
         return
 
@@ -368,9 +373,13 @@ def _advance_edge_cloud_draft(
     )
     if is_target_tail:
         state = getattr(model_output, "edge_cloud_draft_state", None)
+        logger.error(
+            "[MTP-DEBUG] advance_draft target_tail: has_state=%s",
+            state is not None,
+        )
         if state is None:
             return
-        enqueue_draft_first(
+        result = enqueue_draft_first(
             completed_scheduler_output,
             draft_task_id=state["draft_task_id"],
             draft_step_idx=int(state["draft_step_idx"]),
@@ -379,12 +388,17 @@ def _advance_edge_cloud_draft(
                 "valid_sampled_token_count"
             ),
         )
+        logger.error("[MTP-DEBUG] advance_draft enqueue RESULT=%s", result)
         return
 
     if batch_type != BatchType.DRAFT_LAST:
         return
     draft_token_ids = getattr(
         model_output, "edge_cloud_draft_token_ids", None
+    )
+    logger.error(
+        "[MTP-DEBUG] advance_draft draft_last: has_draft_ids=%s",
+        draft_token_ids is not None,
     )
     if draft_token_ids is not None:
         self.scheduler.update_draft_token_ids(draft_token_ids)

@@ -1351,9 +1351,15 @@ class PDSeparatedScheduler(Scheduler):
         req_ids = list(source.num_scheduled_tokens)
         # Worker draft contexts are batch-scoped and are cleared as a whole
         # when any member request finishes or is aborted.
-        if not req_ids or any(
-            req_id not in self.requests for req_id in req_ids
-        ):
+        not_in_requests = [
+            rid for rid in req_ids if rid not in self.requests
+        ]
+        logger.error(
+            "[MTP-DEBUG] enqueue_draft_first: req_ids=%s NOT_IN_REQUESTS=%s "
+            "num_requests=%d draft_step_idx=%s",
+            req_ids, not_in_requests, len(self.requests), draft_step_idx,
+        )
+        if not req_ids or not_in_requests:
             return False
 
         draft_first = replace(
