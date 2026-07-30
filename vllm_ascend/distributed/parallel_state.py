@@ -56,6 +56,68 @@ _EDGE_CLOUD_TENSOR_META_C2E: "EdgeCloudTensorMeta | None" = None
 _EDGE_CLOUD_TENSOR_META: "EdgeCloudTensorMeta | None" = None
 
 
+def _precreate_pp_p2p_comms(pp_group, backend):
+    """Pre-create P2P HCCL communicators for all PP channels (2P1D).
+
+    ProcessGroupHCCL lazily creates P2P communicators on first send/recv.
+    In PD-separation with pipeline depth>1, this lazy creation can deadlock
+    (cloud reaches irecv before edge reaches isend, TCPStore rendezvous
+    blocks).  This function does a dummy send/recv on each channel's
+    device_group to force communicator creation upfront.
+
+    send/recv are blocking and rendezvous via TCPStore (broadcastMasterID),
+    so they are self-synchronizing -- no barrier needed.  getKeySendRecv
+    is symmetric (min:max), so one send/recv pair creates the P2P comm
+    for both directions.
+
+    Uses pp_group.ranks (global ranks) for dst/src, matching how
+    edge_cloud_isend/irecv call dist.isend(dst=pp_group.ranks[dst]).
+    """
+    if pp_group is None or pp_group.world_size <= 1:
+        return
+
+    # Collect (channel_name, device_group) for all 2P1D channels.
+    channels = []
+    # Channel 1: PREFILL_1 (default PP group)
+    if pp_group.device_group is not None:
+        channels.append(("PREFILL_1", pp_group.device_group))
+    # Channel 2: DECODE (alternate group)
+    if pp_group.alt_device_group is not None:
+        channels.append(("DECODE", pp_group.alt_device_group))
+    # Channel 3: PREFILL_2 (hidden channel, if created)
+    if hasattr(pp_group, "_hidden_channel_groups"):
+        try:
+            from vllm.v1.core.sched.output import HiddenChannelType
+            pref2_group, _ = pp_group._hidden_channel_groups(
+                HiddenChannelType.PREFILL_2)
+            if pref2_group is not None:
+                channels.append(("PREFILL_2", pref2_group))
+        except Exception:
+            pass  # PREFILL_2 not configured, skip
+
+    rank_in_group = pp_group.rank_in_group
+    peer_local = 1 - rank_in_group
+    # pp_group.ranks maps local rank -> global rank, e.g. [0,1] or [5,6]
+    peer_global = pp_group.ranks[peer_local]
+
+    dummy = torch.zeros(1, dtype=torch.float32, device="npu")
+
+    for channel_name, device_group in channels:
+        # Edge (rank_in_group=0) sends, cloud (rank_in_group=1) receives.
+        # Both block at TCPStore rendezvous until the peer arrives --
+        # self-synchronizing, no barrier needed.  One send/recv pair
+        # creates the P2P comm for both directions (getKeySendRecv is
+        # symmetric: min:max of the two ranks).
+        if rank_in_group == 0:
+            torch.distributed.send(dummy, dst=peer_global, group=device_group)
+        else:
+            torch.distributed.recv(dummy, src=peer_global, group=device_group)
+        logger.info(
+            "[EdgeCloud] P2P communicator pre-created for channel %s "
+            "(local_rank=%s, peer_global=%s)", channel_name,
+            rank_in_group, peer_global)
+
+
 @dataclass
 class EdgeCloudTensorMeta:
     """Pre-computed tensor metadata for edge-cloud hidden state transfer.
@@ -367,6 +429,18 @@ def init_ascend_model_parallel(
             pp_group.create_alternate_groups(backend)
             if hasattr(pp_group, "create_hidden_channel_groups"):
                 pp_group.create_hidden_channel_groups(backend)
+
+            # Pre-create P2P HCCL communicators for all PP channels (2P1D).
+            # ProcessGroupHCCL creates P2P communicators lazily on first
+            # send/recv via getHCCLComm -> broadcastMasterID -> TCPStore.
+            # In PD-separation with pipeline depth>1, the lazy creation can
+            # deadlock: cloud reaches irecv before edge reaches isend, and
+            # the TCPStore rendezvous blocks until the peer publishes its
+            # master ID.  By doing a dummy send/recv on each channel at
+            # init time (both sides synchronized via barrier), we force the
+            # P2P communicator creation upfront, eliminating the lazy-build
+            # timeout window.
+            _precreate_pp_p2p_comms(pp_group, backend)
 
         # Ascend-specific groups that are currently disabled by default
         # in edge-cloud mode. If enabled in the future, they must follow
@@ -731,6 +805,85 @@ def _get_edge_cloud_hidden_channel_device_group(
     return pp_group.device_group
 
 
+# ----------------------------------------------------------------------- #
+# Dedicated NPU stream for edge-cloud PP isend/irecv                      #
+# ----------------------------------------------------------------------- #
+# PP P2P comm (isend/irecv) runs on dedicated streams instead of the
+# default compute stream. Without separation, a pending isend/irecv on
+# the compute stream blocks the stream's sync points (tolist/.item in
+# gdn attention): the tolist sync waits for the isend, which waits for
+# the remote irecv, which waits for the remote a2a, which waits for the
+# remote compute ... Under batch_queue pipelining this forms a
+# cross-batch circular dependency -> hang. With dedicated streams, the
+# compute stream's tolist only waits for compute ops (gdn/a2a), not for
+# isend/irecv, breaking the cycle.
+#
+# Streams are keyed by (channel, direction) -- per-channel AND
+# per-direction, mirroring MindIE's per-batch [recv_stream, send_stream]
+# pair (atb_llm/utils/layerwise_disaggregated/edge_cloud_data_comm.py):
+#
+#   * channel: each hidden channel (PREFILL_1 / PREFILL_2 / DECODE) gets
+#     its own stream so P2P ops on different channels -- which already
+#     use independent HCCL communicators -- are not serialized by a
+#     shared stream. In 2P1D, cloud sends P2尾 on prefill_2 (isend) while
+#     receiving P3首 on prefill_1 (irecv); a single shared stream would
+#     queue irecv P3首 behind isend P2尾.
+#   * direction: send and recv on the *same* channel use separate
+#     streams. This breaks the intra-channel ordering where an isend
+#     (cloud->edge P尾) stuck waiting on a slow edge irecv would block
+#     the channel's irecv (edge->cloud P首). With the split, irecv P首
+#     on the recv stream proceeds independently of a blocked isend P尾
+#     on the send stream. Sharing one stream per channel re-creates the
+#     deadlock because isend and irecv on that channel serialize.
+#
+# Data dependencies are handled with stream waits:
+#   isend: send_stream.wait_stream(compute) before isend (data must be ready)
+#   irecv: the handle is waited CPU-side by
+#          AsyncIntermediateTensors.wait_for_comm() before the forward
+#          reads the data; the recv_stream->compute dependency is
+#          established lazily by recv_view.record_stream(recv_stream) via
+#          the caching allocator. No eager compute.wait_stream(pp_stream):
+#          that would make the compute stream's tolist (aclrtSynchronizeStream,
+#          full stream sync) wait for the irecv and re-create the
+#          cross-batch pipeline cycle.
+_pp_comm_streams: dict[tuple[Any, str], Any] = {}
+
+# Direction tags for _get_pp_comm_stream. Send = isend path (cloud->edge
+# P尾 / edge->cloud P首); Recv = irecv path (the reverse).
+_PP_COMM_SEND = "send"
+_PP_COMM_RECV = "recv"
+
+
+def _get_pp_comm_stream(channel: Any = None, direction: str | None = None) -> Any:
+    """Lazy-init a dedicated PP communication stream keyed by (channel, direction).
+
+    ``direction`` must be ``_PP_COMM_SEND`` (isend path) or ``_PP_COMM_RECV``
+    (irecv path). Each (channel, direction) pair gets its own NPU stream so
+    that:
+
+      - different hidden channels never serialize on a shared stream, and
+      - send and recv on the same channel never serialize on a shared stream.
+
+    Both properties are required to avoid the 2P1D deadlock: cloud's isend
+    P尾 (send, may block on a slow edge irecv) must not block cloud's irecv
+    P首 (recv, only needs edge to have sent P首). See the module comment
+    above and MindIE's edge_cloud_data_comm.py for the reference design.
+    """
+    if direction not in (_PP_COMM_SEND, _PP_COMM_RECV):
+        raise ValueError(
+            f"_get_pp_comm_stream: direction must be {_PP_COMM_SEND!r} or "
+            f"{_PP_COMM_RECV!r}, got {direction!r}. Pass _PP_COMM_SEND for "
+            "the isend path or _PP_COMM_RECV for the irecv path."
+        )
+    key = (channel, direction)
+    s = _pp_comm_streams.get(key)
+    if s is None:
+        import torch_npu
+        s = torch_npu.npu.Stream()
+        _pp_comm_streams[key] = s
+    return s
+
+
 def edge_cloud_isend_tensor_dict(
     tensor_dict: dict[str, torch.Tensor | Any],
     dst: int | None = None,
@@ -862,14 +1015,21 @@ def edge_cloud_isend_tensor_dict(
             "was initialized with inconsistent per-tensor shapes; re-init "
             "it or unset VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD."
         )
-        handle = torch.distributed.isend(
-            merged, dst=pp_group.ranks[dst], group=group
-        )
-        if merged.is_cuda:
-            merged.record_stream(torch.cuda.current_stream(merged.device))
+        _pps = _get_pp_comm_stream(channel, _PP_COMM_SEND)
+        # pp_stream waits for compute stream: the merged buffer is produced
+        # by the model forward (compute stream); isend must not read it
+        # before the forward completes.
+        _pps.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(_pps):
+            handle = torch.distributed.isend(
+                merged, dst=pp_group.ranks[dst], group=group
+            )
+        merged.record_stream(_pps)
         handles.append(handle)
         return handles
 
+    _pps = _get_pp_comm_stream(channel, _PP_COMM_SEND)
+    _pps.wait_stream(torch.npu.current_stream())
     for key in send_keys:
         value = tensor_dict[key]
         if not isinstance(value, torch.Tensor):
@@ -888,13 +1048,11 @@ def edge_cloud_isend_tensor_dict(
             # only happens when upstream code returned a non-standard
             # layout, in which case we materialize once.
             value = value.contiguous()
-        handle = torch.distributed.isend(
-            value, dst=pp_group.ranks[dst], group=group
-        )
-        if value.is_cuda:
-            value.record_stream(torch.cuda.current_stream(value.device))
-        elif value.device.type == "npu":
-            value.record_stream(torch.npu.current_stream(value.device))
+        with torch.npu.stream(_pps):
+            handle = torch.distributed.isend(
+                value, dst=pp_group.ranks[dst], group=group
+            )
+        value.record_stream(_pps)
         handles.append(handle)
 
     return handles
@@ -1022,15 +1180,33 @@ def edge_cloud_irecv_tensor_dict(
         # the leading num_tokens rows (mirrors the non-merge SP path).  When
         # SP is off this view is the whole buffer, a no-op.
         recv_view = merged[:num_tokens]
-        handle = torch.distributed.irecv(
-            recv_view, src=pp_group.ranks[src], group=group
-        )
-        # Zero-fill the SP padding tail (see the non-merge path for why).
-        # The merged buffer is TP-broadcast and split into per-key tensors,
-        # so the tail padding flows into every per-key tensor; it must be
-        # zero before the broadcast reads it.
+        _pps = _get_pp_comm_stream(channel, _PP_COMM_RECV)
+        # Zero-fill the SP padding tail BEFORE irecv. The padding region
+        # (merged[num_tokens:]) is not touched by irecv (only recv_view =
+        # merged[:num_tokens] is written). Doing this before irecv avoids an
+        # implicit cross-stream sync: if .zero_() runs on the default stream
+        # AFTER irecv is submitted on _pps, the PyTorch caching allocator
+        # detects that `merged` has a pending op on _pps and implicitly
+        # inserts wait_stream(_pps) on the default stream. This blocks the
+        # default stream until irecv completes, which in 2P1D (where edge
+        # may not have sent P首 yet) deadlocks cloud_prepare_early's .to().
+        # Zeroing before irecv is safe because irecv only writes recv_view
+        # (the first num_tokens rows), not the padding tail.
         if merged.shape[0] > num_tokens:
             merged[num_tokens:].zero_()
+        with torch.npu.stream(_pps):
+            handle = torch.distributed.irecv(
+                recv_view, src=pp_group.ranks[src], group=group
+            )
+        recv_view.record_stream(_pps)
+        # NO compute.wait_stream(pp_stream): the irecv handle is waited
+        # CPU-side by AsyncIntermediateTensors.wait_for_comm() (lazy,
+        # triggered when .tensors is accessed) BEFORE the model forward
+        # reads the data. Putting a GPU wait_stream here would make the
+        # compute stream's tolist (aclrtSynchronizeStream, full stream
+        # sync) wait for the irecv, re-creating the cross-batch pipeline
+        # cycle (edge tail gdn -> irecv -> cloud isend -> cloud a2a ->
+        # cloud gdn -> cloud irecv -> edge isend -> edge a2a -> prev batch).
 
         # Pre-populate the dict with empty placeholders so callers can see
         # the expected keys even before postprocess runs.  We replace them
@@ -1059,6 +1235,7 @@ def edge_cloud_irecv_tensor_dict(
     recv_num_tokens = _pad_num_tokens_to_tp_multiple(num_tokens)
     send_keys = set(ec_meta.send_tensor_keys or ec_meta.tensor_keys)
 
+    _pps = _get_pp_comm_stream(channel, _PP_COMM_RECV)
     for key, value in ec_meta.metadata_list:
         if isinstance(value, TensorMetadata):
             # Replace the placeholder dim-0 with the TP-padded size; the
@@ -1074,24 +1251,20 @@ def edge_cloud_irecv_tensor_dict(
 
             if key in send_keys:
                 recv_view = full_tensor[:num_tokens]
-                handle = torch.distributed.irecv(
-                    recv_view, src=pp_group.ranks[src], group=group
-                )
-                handles.append(handle)
-                # Zero-fill the SP padding tail.  The sender only transmits
-                # the real num_tokens rows; the remaining
-                # (recv_num_tokens - num_tokens) rows are padding to satisfy
-                # SP's TP-divisibility and must be zero, not torch.empty's
-                # uninitialized memory.  Garbage here is read by downstream
-                # ops that iterate over the full TP-padded buffer (SP
-                # all-gather inside attention, DSA compression, hc_head/norm)
-                # and probabilistically corrupts batched requests on 3D
-                # (DeepSeek V4) models.  Runs on the compute stream
-                # concurrent with the HCCL irecv (disjoint regions); the
-                # irecv handle wait plus the next HCCL op's compute->HCCL
-                # sync make it visible before any read.
+                # Zero-fill the SP padding tail BEFORE irecv (same fix as
+                # the merge_payload path). .zero_() after irecv creates an
+                # implicit wait_stream(_pps) on the default stream via the
+                # caching allocator, deadlocking in 2P1D when irecv is
+                # pending. Safe before irecv: irecv only writes recv_view
+                # (first num_tokens rows), not the padding tail.
                 if recv_num_tokens > num_tokens:
                     full_tensor[num_tokens:].zero_()
+                with torch.npu.stream(_pps):
+                    handle = torch.distributed.irecv(
+                        recv_view, src=pp_group.ranks[src], group=group
+                    )
+                recv_view.record_stream(_pps)
+                handles.append(handle)
             else:
                 # The sender skipped this tensor (e.g. the zero residual in
                 # embedding_only e2c). Keep the buffer zeroed so the model
@@ -1101,6 +1274,10 @@ def edge_cloud_irecv_tensor_dict(
         else:
             tensor_dict[key] = value
 
+    # NO compute.wait_stream(_pps): handles are waited CPU-side by
+    # AsyncIntermediateTensors.wait_for_comm() before the forward reads
+    # data. A GPU wait_stream here would make tolist (full stream sync)
+    # wait for the irecv, re-creating the pipeline cycle.
     return tensor_dict, handles, postprocess
 
 
