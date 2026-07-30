@@ -817,7 +817,15 @@ class PassiveScheduler:
         if decision.batch_type is not None:
             self._log_queue_state("post-local-decision")
             self._log_local_decision(decision, "post-local-decision")
+        _local_bt = decision.batch_type
         decision = self._coordinate_decision(decision)
+        logger.error(
+            "[COORD-DIAG] DP%s coordinate: local_bt=%s coord_bt=%s",
+            getattr(self.vllm_config.parallel_config,
+                     "data_parallel_rank", 0),
+            _local_bt.value if _local_bt else "EMPTY",
+            decision.batch_type.value if decision.batch_type else "EMPTY",
+        )
         if decision.batch_type is not None:
             self._log_local_decision(decision, "post-coord-decision")
         if decision.batch_type is None:
