@@ -1742,20 +1742,6 @@ class BatchedModelRunner(NPUModelRunner):
             list(merged_query_start_loc_cpu.shape), self.device,
             torch.npu.memory_allocated() // (1024 * 1024),
             torch.npu.memory_reserved() // (1024 * 1024))
-        # Proactive allocator health check: try allocating a
-        # same-shape tensor to detect whether the NPU allocator
-        # was already corrupted by a prior ACL graph replay.
-        try:
-            test = torch.zeros(
-                merged_query_start_loc_cpu.shape, dtype=torch.int32,
-                device=self.device)
-            del test
-        except RuntimeError:
-            logger.error(
-                "[PD] _get_or_build_merged_attn_ctx: "
-                "ALLOCATOR_CORRUPTED before .to() — "
-                "probe allocation failed!")
-            raise
         merged_query_start_loc = merged_query_start_loc_cpu.to(
             self.device)
         logger.info("[PD] _get_or_build_merged_attn_ctx: Step 3 cu_seqlen done query_start_length=%d", len(merged_qsl_cpu_list))
