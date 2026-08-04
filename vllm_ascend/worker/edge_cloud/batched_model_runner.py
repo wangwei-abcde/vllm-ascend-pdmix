@@ -1644,6 +1644,18 @@ class BatchedModelRunner(NPUModelRunner):
         # mode is what the batched head/tail forward should run
         # under (NOT a single dp_rank's mode).
         any_batch_desc = bundles[0].batch_desc
+        # Diagnostic: per-bundle batch type info
+        for bi, b in enumerate(bundles):
+            cm_item = cms_unpadded[bi]
+            n_prefill = int((cm_item.num_computed_tokens_cpu[:b.num_reqs_actual] == 0).sum().item()) if cm_item.num_computed_tokens_cpu is not None else -1
+            n_decode = b.num_reqs_actual - n_prefill if n_prefill >= 0 else -1
+            logger.info(
+                "[PD] _get_or_build_merged_attn_ctx: BATCH_TYPE "
+                "bundle[%d] num_reqs=%d prefill=%d decode=%d "
+                "uniform=%s batch_desc_is_none=%s tokens=%d",
+                bi, b.num_reqs_actual, n_prefill, n_decode,
+                b.batch_desc.uniform if b.batch_desc is not None else "N/A",
+                b.batch_desc is None, b.num_tokens_padded)
         if any_batch_desc is None:
             merged_batch_descriptor = None
             merged_cudagraph_mode = CUDAGraphMode.NONE
@@ -1656,6 +1668,12 @@ class BatchedModelRunner(NPUModelRunner):
             uniform_decode_merged = all(
                 b.batch_desc is not None and b.batch_desc.uniform
                 for b in bundles)
+            logger.info(
+                "[PD] _get_or_build_merged_attn_ctx: DISPATCH_INPUT "
+                "merged_num_actual_tokens=%d uniform_decode=%s "
+                "has_lora=%s",
+                merged_num_actual_tokens, uniform_decode_merged,
+                has_lora_any)
             num_active_loras_merged = sum(
                 (b.batch_desc.num_active_loras
                  if b.batch_desc is not None else 0)
