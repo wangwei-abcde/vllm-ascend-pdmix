@@ -1677,6 +1677,12 @@ class BatchedModelRunner(NPUModelRunner):
                 merged_batch_descriptor.num_tokens)
         logger.info("[PD] _get_or_build_merged_attn_ctx: Step 2 dispatch done mode=%s num_tokens_padded=%d", merged_cudagraph_mode, merged_num_tokens_padded)
         logger.info("[PD] _get_or_build_merged_attn_ctx: _pp_send_work_by_channel=%s", pp_send_work_by_channel)
+        logger.info(
+            "[PD] _get_or_build_merged_attn_ctx: MERGE_SIZES "
+            "merged_num_reqs=%d merged_num_reqs_padded=%d "
+            "max_num_reqs=%d dp_size=%d",
+            merged_num_reqs, merged_num_reqs_padded,
+            self.max_num_reqs, self.dp_size)
 
         # ---- Step 3: merged cu_seqlen (``query_start_loc`` /
         # ``query_start_loc_cpu``). Unpad → cumsum-merge → pad to
@@ -1847,6 +1853,19 @@ class BatchedModelRunner(NPUModelRunner):
         # stable address (matching the standard path's
         # invariant at ``model_runner_v1.py:4393-4396``).
         if merged_cudagraph_mode == CUDAGraphMode.FULL:
+            logger.info(
+                "[PD] _get_or_build_merged_attn_ctx: FULL_BUFFER_COPY "
+                "merged_num_reqs_padded=%d qsl_buf_size=%d "
+                "seq_lens_size=%d opt_seq_lens_cpu_size=%d "
+                "overflow_qsl=%s overflow_seq_lens=%s "
+                "overflow_opt_seq_lens=%s",
+                merged_num_reqs_padded,
+                self.query_start_loc.gpu.shape[0],
+                self.seq_lens.shape[0],
+                self.optimistic_seq_lens_cpu.shape[0],
+                merged_num_reqs_padded + 1 > self.query_start_loc.gpu.shape[0],
+                merged_num_reqs_padded > self.seq_lens.shape[0],
+                merged_num_reqs_padded > self.optimistic_seq_lens_cpu.shape[0])
             self.optimistic_seq_lens_cpu[
                 :merged_num_reqs_padded].copy_(
                     merged_seq_lens_cpu_upper)
