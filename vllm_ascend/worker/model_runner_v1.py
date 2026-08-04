@@ -6267,12 +6267,42 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_layers - self.tail_k,
                 self.num_layers,
             ))
+            # Diagnostic: log intermediate_tensors addresses and
+            # segment_e graph entry output addresses to detect overlap
             if seg_e_graph and not forward_context.capturing:
                 self._update_full_graph_params_if_needed(
                     forward_context, num_tokens_padded, positions,
                     layer_indices=tail_layer_indices,
                     graph_wrapper=seg_e,
                 )
+                # Log intermediate_tensors data_ptr ranges
+                for k, v in intermediate_tensors.tensors.items():
+                    if v is not None:
+                        ptr = v.data_ptr()
+                        nbytes = v.numel() * v.element_size()
+                        logger.info(
+                            "[PD] _edge_cloud_forward_edge: "
+                            "INTERMEDIATE_ADDR key=%s ptr=%d "
+                            "nbytes=%d range=[%d,%d)",
+                            k, ptr, nbytes, ptr, ptr + nbytes)
+                # Log segment_e graph entry output addresses
+                bd = forward_context.batch_descriptor
+                for entry_bd, entry in seg_e.concrete_aclgraph_entries.items():
+                    if entry.output is not None:
+                        try:
+                            out = entry.output()
+                        except Exception:
+                            out = None
+                        if out is not None:
+                            ptr = out.data_ptr()
+                            nbytes = out.numel() * out.element_size()
+                            match = "MATCH" if entry_bd == bd else ""
+                            logger.info(
+                                "[PD] _edge_cloud_forward_edge: "
+                                "GRAPH_OUTPUT_ADDR batch=%s ptr=%d "
+                                "nbytes=%d range=[%d,%d) %s",
+                                entry_bd, ptr, nbytes, ptr,
+                                ptr + nbytes, match)
             hidden_states = seg_e(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
