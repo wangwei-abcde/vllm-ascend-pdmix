@@ -1735,6 +1735,13 @@ class BatchedModelRunner(NPUModelRunner):
             merged_query_start_loc_cpu = merged_query_start_loc_cpu[
                 :merged_num_reqs_padded + 1]
 
+        logger.info(
+            "[PD] _get_or_build_merged_attn_ctx: TO_DEVICE "
+            "tensor_shape=%s device=%s "
+            "npu_allocated_mb=%d npu_reserved_mb=%d",
+            list(merged_query_start_loc_cpu.shape), self.device,
+            torch.npu.memory_allocated() // (1024 * 1024),
+            torch.npu.memory_reserved() // (1024 * 1024))
         merged_query_start_loc = merged_query_start_loc_cpu.to(
             self.device)
         logger.info("[PD] _get_or_build_merged_attn_ctx: Step 3 cu_seqlen done query_start_length=%d", len(merged_qsl_cpu_list))
