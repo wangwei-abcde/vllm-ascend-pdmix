@@ -917,14 +917,45 @@ class PassiveEngineCoreProc:
             )
 
             ready_pipe.send({"status": "READY"})
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "AFTER ready_pipe send READY",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+            )
             ready_pipe.close()
             ready_pipe = None
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "AFTER ready_pipe close",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+            )
 
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "BEFORE _import_passive_scheduler_module",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+            )
             passive_scheduler_module = _import_passive_scheduler_module()
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "AFTER _import_passive_scheduler_module done",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+            )
             dispatch_policy_cls = passive_scheduler_module.DispatchPolicy
             # Load PD-separation configuration from environment variables.
             from vllm_ascend.pd_separation_config import PDSeparationConfig
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "BEFORE PDSeparationConfig.from_env",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+            )
             pd_config = PDSeparationConfig.from_env()
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "AFTER PDSeparationConfig.from_env done, policy=%s",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+                pd_config.dispatch_policy,
+            )
             try:
                 policy = dispatch_policy_cls(pd_config.dispatch_policy)
             except ValueError:
@@ -934,6 +965,12 @@ class PassiveEngineCoreProc:
                     pd_config.dispatch_policy,
                 )
                 policy = dispatch_policy_cls.EXPECT_ALTERNATION
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "AFTER dispatch policy created, policy=%s",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+                policy,
+            )
 
             scheduler_input = None
 
@@ -945,14 +982,30 @@ class PassiveEngineCoreProc:
             # the ``_ASCEND_CONFIG`` singleton is empty; re-init from the
             # ``vllm_config`` we were handed. ``init_ascend_config`` is
             # idempotent on the singleton.
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "BEFORE init_ascend_config",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+            )
             from vllm_ascend.ascend_config import init_ascend_config
             _ascend_config = init_ascend_config(vllm_config)
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "AFTER init_ascend_config done",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+            )
             _edge_cloud = getattr(_ascend_config, "edge_cloud_config", None)
             _pd_enabled = bool(
                 _edge_cloud is not None
                 and getattr(_edge_cloud, "enabled", False)
                 and getattr(_edge_cloud, "pd_separation", None) is not None
                 and _edge_cloud.pd_separation.enabled
+            )
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "AFTER _pd_enabled check, _pd_enabled=%s",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+                _pd_enabled,
             )
             if _pd_enabled:
                 master_addr = vllm_config.parallel_config.master_addr
