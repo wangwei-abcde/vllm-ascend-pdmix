@@ -535,3 +535,4 @@ def bind_cpus(rank_id: int) -> None:
         return
     binder = CpuAlloc(rank_id)
     binder.run_all()
+    logger.info("[DP-DIAG] rank_id=%s: bind_cpus ALL DONE (CPU绑定完成)", rank_id)

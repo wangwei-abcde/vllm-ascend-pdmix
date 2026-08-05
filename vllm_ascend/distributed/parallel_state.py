@@ -701,6 +701,11 @@ def init_ascend_model_parallel(
             backend,
             group_name="mc2",
         )
+        logger.info(
+            "[DP-DIAG] rank=%s: AFTER MC2 group created, "
+            "edge_ranks=%s cloud_ranks=%s",
+            torch.distributed.get_rank(), ep_edge_ranks, ep_cloud_ranks,
+        )
 
         # Phase6 hidden data-plane channels are still required in edge-cloud
         # mode.  The default PP group is PREFILL_1, the alternate PP group is
@@ -739,7 +744,15 @@ def init_ascend_model_parallel(
             # cloud side would make the two sides rendezvous on different
             # channels and deadlock.
             if envs.VLLM_ASCEND_EDGE_CLOUD_CHANNEL_WARMUP:
+                logger.info(
+                    "[DP-DIAG] rank=%s: BEFORE warmup_edge_cloud_hidden_channels start",
+                    torch.distributed.get_rank(),
+                )
                 warmup_edge_cloud_hidden_channels(parallel_config)
+                logger.info(
+                    "[DP-DIAG] rank=%s: AFTER warmup_edge_cloud_hidden_channels done",
+                    torch.distributed.get_rank(),
+                )
 
         # Ascend-specific groups that are currently disabled by default
         # in edge-cloud mode. If enabled in the future, they must follow

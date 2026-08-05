@@ -904,7 +904,17 @@ class PassiveEngineCoreProc:
 
         executor = None
         try:
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "BEFORE MultiprocExecutor init start",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+            )
             executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+            logger.info(
+                "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                "AFTER MultiprocExecutor init done (all workers ready)",
+                getattr(vllm_config.parallel_config, "data_parallel_rank", 0),
+            )
 
             ready_pipe.send({"status": "READY"})
             ready_pipe.close()
@@ -963,6 +973,12 @@ class PassiveEngineCoreProc:
                 _dp_rank = getattr(
                     vllm_config.parallel_config, "data_parallel_rank", 0
                 )
+                logger.info(
+                    "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                    "BEFORE TCPStore cloud_ip report, cloud_ip=%s "
+                    "edge=%s:%s",
+                    _dp_rank, _cloud_ip, master_addr, master_port + 1 + _dp_rank,
+                )
                 _addr_store = dist.TCPStore(
                     host_name=master_addr,
                     port=master_port + 1 + _dp_rank,
@@ -972,6 +988,11 @@ class PassiveEngineCoreProc:
                 )
                 _addr_store.set("cloud_ip", _cloud_ip)
                 del _addr_store
+                logger.info(
+                    "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                    "AFTER TCPStore cloud_ip reported successfully",
+                    _dp_rank,
+                )
 
                 # ZMQ ports are offset per DP rank on the edge side
                 # (dp_rank * 2). The cloud mirrors this offsetting.
@@ -983,6 +1004,12 @@ class PassiveEngineCoreProc:
                 _post_out_port = pd_config.post_out_port + _dp_rank * 2
                 post_out_bind = f"tcp://*:{_post_out_port}"
                 pre_out_connect = f"tcp://{master_addr}:{_pre_out_port}"
+                logger.info(
+                    "[DP-DIAG] Cloud PassiveEngineCore dp_rank=%s: "
+                    "BEFORE PPSchedulerZmqChannel init, "
+                    "POST_OUT=%s PRE_OUT=%s",
+                    _dp_rank, post_out_bind, pre_out_connect,
+                )
                 pp_pd_channel = PPSchedulerZmqChannel(
                     send_endpoint=post_out_bind,
                     recv_endpoint=pre_out_connect,

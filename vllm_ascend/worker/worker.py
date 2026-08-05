@@ -379,7 +379,15 @@ class NPUWorker(WorkerBase):
             )
 
         # Initialize the distributed environment.
+        logger.info(
+            "[DP-DIAG] rank=%s local_rank=%s: BEFORE _init_worker_distributed_environment start",
+            self.rank, self.local_rank,
+        )
         self._init_worker_distributed_environment()
+        logger.info(
+            "[DP-DIAG] rank=%s local_rank=%s: AFTER _init_worker_distributed_environment done",
+            self.rank, self.local_rank,
+        )
         # Set random seed.
         set_random_seed(self.model_config.seed)
         # Initialize device properties used by triton kernels.
@@ -1736,6 +1744,11 @@ class NPUWorker(WorkerBase):
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
+        logger.info(
+            "[DP-DIAG] rank=%s local_rank=%s: _init_worker_dist_env start, "
+            "distributed_init_method=%s",
+            self.rank, self.local_rank, self.distributed_init_method,
+        )
         init_batch_invariance()
         # NOTE: `self.local_rank` is also consumed by `bind_cpus` for CPU
         # binding, so it must stay as the original TP local rank. Compute the
@@ -1758,8 +1771,22 @@ class NPUWorker(WorkerBase):
             local_world_size = parallel_config.local_world_size
             # DP_LOCAL_RANK * LOCAL_WORLD_SIZE + TP_LOCAL_RANK
             local_rank += dp_local_rank * local_world_size
+        logger.info(
+            "[DP-DIAG] rank=%s local_rank=%s: BEFORE init_distributed_environment "
+            "world_size=%s init_method=%s backend=hccl",
+            self.rank, local_rank, self.parallel_config.world_size,
+            self.distributed_init_method,
+        )
         init_distributed_environment(
             self.parallel_config.world_size, self.rank, self.distributed_init_method, local_rank, "hccl"
+        )
+        logger.info(
+            "[DP-DIAG] rank=%s local_rank=%s: AFTER init_distributed_environment done",
+            self.rank, self.local_rank,
+        )
+        logger.info(
+            "[DP-DIAG] rank=%s local_rank=%s: BEFORE ensure_model_parallel_initialized",
+            self.rank, self.local_rank,
         )
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,
@@ -1767,8 +1794,21 @@ class NPUWorker(WorkerBase):
             self.parallel_config.prefill_context_parallel_size,
             self.parallel_config.decode_context_parallel_size,
         )
+        logger.info(
+            "[DP-DIAG] rank=%s local_rank=%s: AFTER ensure_model_parallel_initialized done, "
+            "BEFORE init_ascend_model_parallel",
+            self.rank, self.local_rank,
+        )
         init_ascend_model_parallel(self.parallel_config)
+        logger.info(
+            "[DP-DIAG] rank=%s local_rank=%s: AFTER init_ascend_model_parallel done",
+            self.rank, self.local_rank,
+        )
         ensure_ec_transfer_initialized(self.vllm_config)
+        logger.info(
+            "[DP-DIAG] rank=%s local_rank=%s: _init_worker_dist_env all done",
+            self.rank, self.local_rank,
+        )
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()
