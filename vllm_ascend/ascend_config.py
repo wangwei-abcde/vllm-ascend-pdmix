@@ -55,6 +55,7 @@ class AscendConfig:
 
         profiling_chunk_config = additional_config.get("profiling_chunk_config", {})
         self.profiling_chunk_config = ProfilingChunkConfig(profiling_chunk_config)
+        logger.info("[DP-DIAG] AscendConfig.__init__: step1 sub-configs done")
         if self.profiling_chunk_config.enabled:
             max_batched = vllm_config.scheduler_config.max_num_batched_tokens
             if max_batched < self.profiling_chunk_config.min_chunk:
@@ -88,6 +89,7 @@ class AscendConfig:
             "VLLM_ASCEND_ENABLE_FLASHCOMM1",
             ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM1,
         )
+        logger.info("[DP-DIAG] AscendConfig.__init__: step2 import+balance_scheduling done")
         if self.profiling_chunk_config.enabled and self.enable_balance_scheduling:
             raise ValueError(
                 "profiling_chunk_config and balance scheduling (enable_balance_scheduling) "
@@ -138,6 +140,7 @@ class AscendConfig:
         self.multistream_dsa_preprocess = additional_config.get("multistream_dsa_preprocess", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", False)
         self.prefill_comm_compute_overlap = additional_config.get("prefill_comm_compute_overlap", False)
+        logger.info("[DP-DIAG] AscendConfig.__init__: step3 se_dp+basic_configs done")
 
         self.enable_context_parallel = self._get_config_value(
             additional_config,
@@ -181,6 +184,7 @@ class AscendConfig:
             "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK",
             ascend_envs.VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK,
         )
+        logger.info("[DP-DIAG] AscendConfig.__init__: step4 _get_config_values batch done")
 
         self.pd_tp_ratio = 1
         self.pd_head_ratio = 1
@@ -210,6 +214,7 @@ class AscendConfig:
         from vllm_ascend.utils import get_flashcomm2_config_and_validate
 
         self.flashcomm2_oproj_tensor_parallel_size = get_flashcomm2_config_and_validate(self, vllm_config)
+        logger.info("[DP-DIAG] AscendConfig.__init__: step5 pd_tp_ratio+flashcomm2 done")
         # We find that _npu_paged_attention still performs better than
         # npu_fused_infer_attention_score in some cases. We allow to execute
         # _npu_paged_attention in this cases. This should be removed once
@@ -245,6 +250,7 @@ class AscendConfig:
                 raise NotImplementedError(
                     "enable_kv_nz is only supported in pd scenario and can only be used in D node."
                 )
+        logger.info("[DP-DIAG] AscendConfig.__init__: step6 weight_nz+async_exp+kv_nz done")
 
         from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -272,9 +278,11 @@ class AscendConfig:
 
         # Enable optimized reduce sampling scheme
         self.enable_reduce_sample = additional_config.get("enable_reduce_sample", False)
+        logger.info("[DP-DIAG] AscendConfig.__init__: step7 sparse_c8+sp_by_pass+mc2 done")
         edge_cloud_config = additional_config.get("edge_cloud_config", {})
         self.edge_cloud_config = EdgeCloudConfig(edge_cloud_config, vllm_config)
         self._check_edge_cloud_spec_decode(vllm_config)
+        logger.info("[DP-DIAG] AscendConfig.__init__: step8 edge_cloud_config done")
 
         self.mix_placement = additional_config.get("mix_placement", False)
         self._check_mix_placement()
@@ -283,6 +291,7 @@ class AscendConfig:
         self.enable_hamming_sparse = self.hamming_sparse["enabled"]
         self.sparse_json = self.hamming_sparse["sparse_json_location"]
         self._check_enable_hamming_sparse()
+        logger.info("[DP-DIAG] AscendConfig.__init__: step9 hamming_sparse done")
         logger.info("[DP-DIAG] AscendConfig.__init__: ALL DONE")
 
     @staticmethod
