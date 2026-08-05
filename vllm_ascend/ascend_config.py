@@ -30,6 +30,8 @@ class AscendConfig:
     """
 
     def __init__(self, vllm_config: "VllmConfig"):
+        from vllm.logger import logger
+        logger.info("[DP-DIAG] AscendConfig.__init__: START")
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
 
@@ -281,6 +283,7 @@ class AscendConfig:
         self.enable_hamming_sparse = self.hamming_sparse["enabled"]
         self.sparse_json = self.hamming_sparse["sparse_json_location"]
         self._check_enable_hamming_sparse()
+        logger.info("[DP-DIAG] AscendConfig.__init__: ALL DONE")
 
     @staticmethod
     def _get_config_value(additional_config: dict[str, Any], config_key: str, env_key: str, env_value: Any) -> Any:
@@ -895,16 +898,26 @@ def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:
 
 
 def init_ascend_config(vllm_config):
+    from vllm.logger import logger
     additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
     refresh = additional_config.get("refresh", False) if additional_config else False
     global _ASCEND_CONFIG
+    logger.info(
+        "[DP-DIAG] init_ascend_config: BEFORE singleton check, "
+        "cached=%s refresh=%s",
+        _ASCEND_CONFIG is not None, refresh,
+    )
     if _ASCEND_CONFIG is not None and not refresh and _is_ascend_config_initialized(_ASCEND_CONFIG):
+        logger.info("[DP-DIAG] init_ascend_config: returning cached singleton")
         return _ASCEND_CONFIG
+    logger.info("[DP-DIAG] init_ascend_config: BEFORE AscendConfig() constructor")
     new_config = AscendConfig(vllm_config)
+    logger.info("[DP-DIAG] init_ascend_config: AFTER AscendConfig() constructor done")
     if _is_ascend_config_initialized(new_config):
         _ASCEND_CONFIG = new_config
     else:
         logger.warning("Ascend config instance is not fully initialized; skip singleton cache update.")
+    logger.info("[DP-DIAG] init_ascend_config: ALL DONE returning new_config")
     return new_config
 
 
