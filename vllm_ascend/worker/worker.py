@@ -1109,14 +1109,16 @@ class NPUWorker(WorkerBase):
                 layer_slice_info=layer_slice_info,
             )
             return None
+        _t_em_enter = time.perf_counter()
         logger.info(
-            f"Execute model, batch_type: {scheduler_output.batch_type}, " + (
+            f"[TIMING] Execute model enter, batch_type: {scheduler_output.batch_type}, " + (
                 f"slice: {layer_slice_info.slice_index + 1}/{layer_slice_info.total_slices}, "
                 f"layers: [{layer_slice_info.start_layer},{layer_slice_info.end_layer})"
                 if layer_slice_info is not None
                 else "slice: N/A"
             ) + (
-                f", tokens={scheduler_output.total_num_scheduled_tokens}"
+                f", tokens={scheduler_output.total_num_scheduled_tokens},"
+                f" t={_t_em_enter:.6f}"
             )
         )
         intermediate_tensors = None
@@ -1130,7 +1132,14 @@ class NPUWorker(WorkerBase):
         # initialised in the cloud worker's all_token_ids, otherwise a
         # subsequent DECODE_FIRST / DRAFT_FIRST will KeyError in _update_states.
         if is_first_slice:
+            _t_pre_cpe = time.perf_counter()
             self.model_runner.cloud_prepare_early(scheduler_output)
+            _t_post_cpe = time.perf_counter()
+            logger.info(
+                "[TIMING] cloud_prepare_early done, dt=%.6f, total=%.6f",
+                _t_post_cpe - _t_pre_cpe,
+                _t_post_cpe - _t_em_enter,
+            )
         if forward_pass and is_first_slice:
             # [CHER] Atomically reuse the guard thread's early-recv entry, or
             # post the irecv ourselves.  get_or_post_early_recv guarantees at

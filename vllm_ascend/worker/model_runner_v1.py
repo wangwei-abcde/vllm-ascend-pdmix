@@ -1690,7 +1690,19 @@ class NPUModelRunner(GPUModelRunner):
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
         packed_tensor[2][self.dp_rank] = self._dp_batch_type_id
+        _t_ar_enter = time.perf_counter()
+        logger.info(
+            "[TIMING] sync_meta all_reduce enter, dp_rank=%s dp_size=%s "
+            "my_bt=%s num_tokens=%s t=%.6f",
+            self.dp_rank, self.dp_size, self._dp_batch_type_id,
+            num_tokens, _t_ar_enter,
+        )
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
+        _t_ar_done = time.perf_counter()
+        logger.info(
+            "[TIMING] sync_meta all_reduce done, dt=%.6f",
+            _t_ar_done - _t_ar_enter,
+        )
 
         # Extract peer's batch_type_id (for DUMMY to match real's segment)
         self._peer_batch_type_id = int(packed_tensor[2, 1 - self.dp_rank].item())
@@ -5895,6 +5907,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens_compressed_list,
             ) = precomputed
         else:
+            _t_pre_pi = time.perf_counter()
             (
                 logits_indices,
                 spec_decode_metadata,
@@ -5903,6 +5916,11 @@ class NPUModelRunner(GPUModelRunner):
             ) = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
+            )
+            _t_post_pi = time.perf_counter()
+            logger.info(
+                "[TIMING] _prepare_inputs done, dt=%.6f",
+                _t_post_pi - _t_pre_pi,
             )
 
         num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
@@ -5917,6 +5935,7 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output.num_common_prefix_blocks,
             )
 
+        _t_pre_dbeap = time.perf_counter()
         (
             cudagraph_mode,
             batch_desc,
@@ -5931,6 +5950,11 @@ class NPUModelRunner(GPUModelRunner):
             use_cascade_attn=cascade_attn_prefix_lens is not None,
             force_eager=self.model_config.enforce_eager,
             num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+        )
+        _t_post_dbeap = time.perf_counter()
+        logger.info(
+            "[TIMING] _determine_batch_execution_and_padding done, dt=%.6f",
+            _t_post_dbeap - _t_pre_dbeap,
         )
         
         num_tokens_padded = batch_desc.num_tokens
@@ -6013,7 +6037,12 @@ class NPUModelRunner(GPUModelRunner):
             "cloud_prepare_early should only be called on cloud side"
         )
 
+        _t_cpe_enter = time.perf_counter()
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        logger.info(
+            "[TIMING] cloud_prepare_early enter, num_tokens=%s bt=%s t=%.6f",
+            num_scheduled_tokens, scheduler_output.batch_type, _t_cpe_enter,
+        )
         if not num_scheduled_tokens:
             self._cloud_prepare_cache = None
             # Still run _update_states: a zero-token slice may be the first
@@ -6088,6 +6117,11 @@ class NPUModelRunner(GPUModelRunner):
 
         # --- _update_states ---
         self._update_states(scheduler_output)
+        _t_after_us = time.perf_counter()
+        logger.info(
+            "[TIMING] after _update_states, dt=%.6f",
+            _t_after_us - _t_cpe_enter,
+        )
 
         # --- Run core input preparation ---
         # cloud_prepare_early runs BEFORE the forward pass (outside
@@ -6096,7 +6130,14 @@ class NPUModelRunner(GPUModelRunner):
         # preparation inside inference_mode to stay compatible with
         # PyTorch >= 2.0 inference tensor protection.
         with torch.inference_mode():
+            _t_pre_rip = time.perf_counter()
             cache = self._run_input_preparation(scheduler_output)
+            _t_post_rip = time.perf_counter()
+        logger.info(
+            "[TIMING] _run_input_preparation done, dt=%.6f, total=%.6f",
+            _t_post_rip - _t_pre_rip,
+            _t_post_rip - _t_cpe_enter,
+        )
 
         # If the batch became empty after _update_states (num_reqs == 0),
         # _run_input_preparation returns a zeroed placeholder.  Don't cache
